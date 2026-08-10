@@ -6,10 +6,29 @@
 //! Stage 0 的子命令還是 `todo!()`，所以這裡只驗證「解析層」的行為。
 //! 子命令真正的行為測試會隨著 Stage 1 / Stage 3 一起加。
 
+use std::path::PathBuf;
 use std::process::Command;
 
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_codegraph"))
+}
+
+/// 帶 repo 邊界（`.git`）的暫存目錄——避免往上找索引時撞到
+/// 家目錄可能存在的 `.codegraph/`。
+fn tmpdir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("codegraph-e2e-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    dir
+}
+
+fn run(args: &[&str]) -> (bool, String, String) {
+    let out = bin().args(args).output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 #[test]
@@ -56,7 +75,6 @@ fn unknown_subcommand_is_rejected() {
 }
 
 /// 每個子命令都接受一個選擇性的路徑參數。
-/// 這裡只檢查參數解析接受它——實際行為在後續 Stage。
 #[test]
 fn subcommands_accept_an_optional_path() {
     for sub in ["init", "index", "status"] {
@@ -68,4 +86,52 @@ fn subcommands_accept_an_optional_path() {
             "`{sub}` 沒有選擇性的 PATH 參數：{stdout}"
         );
     }
+}
+
+/// 使用者真正會走的第一段路：init 之後 status 要看得到一個空索引。
+#[test]
+fn init_then_status_is_the_happy_path() {
+    let root = tmpdir("happy");
+    let path = root.to_str().unwrap();
+
+    let (ok, stdout, stderr) = run(&["init", path]);
+    assert!(ok, "init 失敗：{stderr}");
+    assert!(stdout.contains("已建立索引目錄"), "{stdout}");
+    assert!(root.join(".codegraph").join("graph.db").is_file());
+    assert!(root.join(".codegraph").join("config.toml").is_file());
+
+    let (ok, stdout, stderr) = run(&["status", path]);
+    assert!(ok, "status 失敗：{stderr}");
+    assert!(stdout.contains("符號      0"), "{stdout}");
+    assert!(stdout.contains("索引是空的"), "{stdout}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 重跑 init 是安全的，而且要說明自己什麼都沒做。
+#[test]
+fn init_twice_is_safe() {
+    let root = tmpdir("twice");
+    let path = root.to_str().unwrap();
+
+    assert!(run(&["init", path]).0);
+    let (ok, stdout, _) = run(&["init", path]);
+    assert!(ok);
+    assert!(stdout.contains("索引已存在"), "{stdout}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 沒有索引的目錄：status 要以錯誤結束，但訊息必須是可行動的引導，
+/// 不是 panic 或 SQLite 的原始錯誤。
+#[test]
+fn status_without_an_index_explains_itself() {
+    let root = tmpdir("bare");
+    let (ok, _, stderr) = run(&["status", root.to_str().unwrap()]);
+
+    assert!(!ok, "沒有索引時 status 不該回報成功");
+    assert!(stderr.contains(".codegraph"), "訊息要指出缺什麼：{stderr}");
+    assert!(!stderr.contains("panicked"), "不該是 panic：{stderr}");
+
+    std::fs::remove_dir_all(&root).ok();
 }

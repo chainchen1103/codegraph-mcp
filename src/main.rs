@@ -1,11 +1,12 @@
 //! CodeGraph CLI。
 //!
-//! 這一層刻意做薄：只負責解析參數與呼叫 lib，不含任何商業邏輯。
+//! 這一層刻意做薄：只負責解析參數、呼叫 lib、印出結果。
 //! MCP server（Stage 9）會呼叫同一組 lib 函數，兩邊行為才不會分岔。
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use code_graph::cli;
 
 #[derive(Parser)]
 #[command(
@@ -20,7 +21,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 在指定目錄建立 .codegraph/ 索引（不會自動開始索引）
+    /// 在指定目錄建立 .codegraph/（不會自動開始索引）
     Init {
         /// 專案根目錄，預設為現在的工作目錄
         path: Option<PathBuf>,
@@ -40,9 +41,12 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
-        Command::Init { path } => todo!("Stage 1: cli::init（path = {path:?}）"),
+    let report = match cli.command {
+        Command::Init { path } => cli::init::run(path.as_deref())?,
+        Command::Status { path } => cli::status::run(path.as_deref())?,
         Command::Index { path } => todo!("Stage 3: cli::index（path = {path:?}）"),
-        Command::Status { path } => todo!("Stage 1: cli::status（path = {path:?}）"),
-    }
+    };
+
+    print!("{report}");
+    Ok(())
 }
