@@ -3,4 +3,18 @@ name = "code_graph"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "code_graph"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codegraph"
+path = "src/main.rs"
+
 [dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.5", features = ["derive"] }
+# bundled 是硬性要求：編入 SQLite amalgamation 並啟用 FTS5，
+# 保證所有平台行為一致。不加的話 Windows 上連結不到系統 libsqlite3，
+# 就算連得到也不保證編譯時開了 FTS5。見 DESIGN.md §9.3。
+rusqlite = { version = "0.40", features = ["bundled"] }
