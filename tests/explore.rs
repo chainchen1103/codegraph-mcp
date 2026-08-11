@@ -199,6 +199,64 @@ fn the_output_is_identical_across_runs() {
     assert_eq!(f.ask("open").text, f.ask("open").text);
 }
 
+/// 超大檔案裡的符號要能單獨取回，而不是被迫接受檔案開頭那一段。
+///
+/// 這是額度分配最容易寫錯的地方：以檔案為單位截斷的話，一次查詢只會
+/// 回到整份檔案的極小一部分，呼叫端只能自己去翻檔案。
+#[test]
+fn a_symbol_deep_inside_a_huge_file_is_returned_on_its_own() {
+    let filler: String = (0..12_000)
+        .map(|i| format!("pub fn noise{i}() -> u32 {{\n    {i}\n}}\n\n"))
+        .collect();
+    assert!(filler.len() > 400_000, "測試檔案不夠大");
+
+    let source = format!("{filler}pub fn needle() -> u32 {{\n    42\n}}\n");
+    let f = Fixture::new("huge", &[("src/huge.rs", &source)]);
+
+    let out = f.ask("needle");
+
+    assert_eq!(out.selection.hits.len(), 1);
+    assert!(out.text.contains("pub fn needle() -> u32"), "{}", out.text);
+    assert!(out.text.contains("42"), "{}", out.text);
+    assert!(
+        !out.text.contains("noise0"),
+        "回傳的是檔案開頭而不是要的符號"
+    );
+
+    let hit = &out.selection.hits[0];
+    assert!(hit.start_line > 10_000, "符號應該落在檔案深處");
+}
+
+/// 一個檔案裡命中太多符號時，額度用完的部分要回報數量。
+#[test]
+fn results_beyond_the_budget_are_reported_not_silently_dropped() {
+    let body = "    let value = 1;\n".repeat(30);
+    let source: String = (0..60)
+        .map(|i| format!("pub fn wide{i}() {{\n{body}}}\n"))
+        .collect();
+    let f = Fixture::new("budget", &[("src/wide.rs", &source)]);
+
+    let out = f.ask("src/wide.rs");
+
+    assert_eq!(out.selection.hits.len(), 60);
+    assert!(out.text.contains("未列出"), "{}", out.text);
+    assert!(out.text.contains("共 60"), "{}", out.text);
+    assert!(
+        out.text.chars().count() < out.budget.max_chars * 2,
+        "輸出遠超過額度"
+    );
+}
+
+/// 專案越大額度越寬，且不會反向縮小。
+#[test]
+fn the_budget_follows_the_size_of_the_project() {
+    let f = fixture("budgettier");
+    assert_eq!(
+        f.ask("open").budget,
+        code_graph::explore::budget::for_file_count(2)
+    );
+}
+
 /// 索引之後才修改的檔案，查詢要回傳磁碟上的新內容。
 #[test]
 fn edits_made_after_indexing_show_up_immediately() {

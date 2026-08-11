@@ -13,7 +13,7 @@ pub mod project;
 pub mod store;
 
 pub use error::{CgError, NotIndexedReason, Result};
-pub use explore::Exploration;
+pub use explore::{Exploration, budget::Budget};
 pub use extract::FileParse;
 pub use indexer::IndexReport;
 pub use model::{

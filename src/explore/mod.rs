@@ -1,5 +1,6 @@
 //! 查詢入口：輸入名字或問題，取得相關符號的逐字原始碼。
 
+pub mod budget;
 pub mod query;
 pub mod render;
 pub mod select;
@@ -12,6 +13,8 @@ use crate::store::Store;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Exploration {
     pub selection: select::Selection,
+    /// 這次查詢所依據的額度。
+    pub budget: budget::Budget,
     /// 已排版、可直接輸出的文字。
     pub text: String,
 }
@@ -30,9 +33,14 @@ impl Exploration {
 pub fn explore(project: &Project, store: &Store, input: &str) -> Result<Exploration> {
     let parsed = query::parse(input);
     let selection = select::select(store.conn(), &parsed)?;
-    let text = render::render(project.root(), &selection);
+    let budget = budget::for_file_count(store.stats()?.files.max(0) as usize);
+    let text = render::render(project.root(), &selection, budget);
 
-    Ok(Exploration { selection, text })
+    Ok(Exploration {
+        selection,
+        budget,
+        text,
+    })
 }
 
 #[cfg(test)]

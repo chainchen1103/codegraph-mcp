@@ -12,6 +12,19 @@ const TEXT_SEARCH_LIMIT: usize = 20;
 /// 查無結果時建議的候選數。
 const SUGGESTION_LIMIT: usize = 8;
 
+/// 符號被選中的原因。決定輸出額度的分配順序。
+///
+/// 之後加入呼叫路徑時，路徑上的符號會排在最前面。
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Origin {
+    /// 使用者直接指名的符號。
+    Named,
+    /// 使用者指定的檔案裡的符號。
+    Path,
+    /// 全文檢索找到的符號。
+    Text,
+}
+
 /// 一個被選中的符號。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
@@ -24,6 +37,7 @@ pub struct Hit {
     pub end_line: u32,
     pub signature: Option<String>,
     pub docstring: Option<String>,
+    pub origin: Origin,
 }
 
 /// 一次挑選的結果。
@@ -44,7 +58,7 @@ pub fn select(conn: &Connection, query: &Query) -> Result<Selection> {
     let mut selection = Selection::default();
 
     for name in &query.names {
-        let hits = by_name(conn, name)?;
+        let hits = by_name(conn, name, Origin::Named)?;
         if hits.is_empty() {
             selection.unmatched.push(name.clone());
         } else {
@@ -53,7 +67,7 @@ pub fn select(conn: &Connection, query: &Query) -> Result<Selection> {
     }
 
     for path in &query.paths {
-        let hits = by_path(conn, path)?;
+        let hits = by_path(conn, path, Origin::Path)?;
         if hits.is_empty() {
             selection.unmatched.push(path.clone());
         } else {
@@ -62,7 +76,7 @@ pub fn select(conn: &Connection, query: &Query) -> Result<Selection> {
     }
 
     if !query.text.is_empty() {
-        let hits = by_text(conn, &query.text)?;
+        let hits = by_text(conn, &query.text, Origin::Text)?;
         if hits.is_empty() {
             selection.unmatched.extend(query.text.iter().cloned());
         } else {
@@ -86,7 +100,7 @@ pub fn select(conn: &Connection, query: &Query) -> Result<Selection> {
 /// `Store::open` 與模組層的 `open` 都要回傳，只回其中一個等於逼呼叫端
 /// 自己去翻檔案挑。查 `Store::open` 時裸名不可能相等，自然只會命中
 /// 那一個方法。
-fn by_name(conn: &Connection, name: &str) -> Result<Vec<Hit>> {
+fn by_name(conn: &Connection, name: &str, origin: Origin) -> Result<Vec<Hit>> {
     for sql in [
         "SELECT s.id, s.name, s.qualified, s.kind, f.path, s.start_line, s.end_line,
                 s.signature, s.docstring
@@ -97,7 +111,7 @@ fn by_name(conn: &Connection, name: &str) -> Result<Vec<Hit>> {
          FROM symbols s JOIN files f ON f.id = s.file_id
          WHERE lower(s.qualified) = lower(?1) OR lower(s.name) = lower(?1)",
     ] {
-        let hits = collect(conn, sql, rusqlite::params![name])?;
+        let hits = collect(conn, sql, rusqlite::params![name], origin)?;
         if !hits.is_empty() {
             return Ok(hits);
         }
@@ -105,7 +119,7 @@ fn by_name(conn: &Connection, name: &str) -> Result<Vec<Hit>> {
     Ok(Vec::new())
 }
 
-fn by_path(conn: &Connection, path: &str) -> Result<Vec<Hit>> {
+fn by_path(conn: &Connection, path: &str, origin: Origin) -> Result<Vec<Hit>> {
     let normalized = crate::extract::moniker::normalize_path(path);
 
     for sql in [
@@ -119,7 +133,7 @@ fn by_path(conn: &Connection, path: &str) -> Result<Vec<Hit>> {
          FROM symbols s JOIN files f ON f.id = s.file_id
          WHERE f.path = ?1 OR f.path LIKE '%/' || ?1",
     ] {
-        let hits = collect(conn, sql, rusqlite::params![normalized])?;
+        let hits = collect(conn, sql, rusqlite::params![normalized], origin)?;
         if !hits.is_empty() {
             return Ok(hits);
         }
@@ -127,7 +141,7 @@ fn by_path(conn: &Connection, path: &str) -> Result<Vec<Hit>> {
     Ok(Vec::new())
 }
 
-fn by_text(conn: &Connection, words: &[String]) -> Result<Vec<Hit>> {
+fn by_text(conn: &Connection, words: &[String], origin: Origin) -> Result<Vec<Hit>> {
     let expression = words
         .iter()
         .map(|w| format!("\"{}\"", w.replace('"', "")))
@@ -147,6 +161,7 @@ fn by_text(conn: &Connection, words: &[String]) -> Result<Vec<Hit>> {
         conn,
         sql,
         rusqlite::params![expression, TEXT_SEARCH_LIMIT as i64],
+        origin,
     )
 }
 
@@ -197,7 +212,12 @@ fn shared_prefix(token: &str) -> String {
     chars[..len].iter().collect()
 }
 
-fn collect(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<Hit>> {
+fn collect(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn rusqlite::ToSql],
+    origin: Origin,
+) -> Result<Vec<Hit>> {
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(params, |r| {
         let raw_kind: u8 = r.get(3)?;
@@ -211,6 +231,7 @@ fn collect(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Res
             end_line: r.get(6)?,
             signature: r.get(7)?,
             docstring: r.get(8)?,
+            origin,
         })
     })?;
 
@@ -224,12 +245,14 @@ fn collect(conn: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Res
 /// 去除重複並排序。
 ///
 /// 排序鍵固定為檔案、起始行、名稱，讓同一個查詢每次的輸出完全相同。
+/// 同一個符號被多種方式選中時，保留優先度最高的來源。
 fn dedup_and_sort(hits: &mut Vec<Hit>) {
     hits.sort_by(|a, b| {
         a.file
             .cmp(&b.file)
             .then(a.start_line.cmp(&b.start_line))
             .then(a.name.cmp(&b.name))
+            .then(a.origin.cmp(&b.origin))
     });
     hits.dedup_by_key(|h| h.id);
 }
