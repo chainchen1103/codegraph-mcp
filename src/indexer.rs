@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use crate::error::Result;
 use crate::extract;
 use crate::project::{Project, walk};
+use crate::resolve::{self, ResolveReport};
 use crate::store::Store;
 use crate::store::write::{Writer, rebuild_fts};
 
@@ -26,6 +27,8 @@ pub struct IndexReport {
     pub symbols: usize,
     /// 因為 moniker 重複而未寫入的符號數。
     pub skipped_symbols: usize,
+    /// 引用解析的結果。
+    pub resolve: ResolveReport,
     /// 讀取失敗或語法有問題的檔案。
     pub warnings: Vec<String>,
     pub elapsed: Duration,
@@ -98,6 +101,7 @@ pub fn index_project(project: &Project, store: &mut Store) -> Result<IndexReport
     }
 
     store.with_transaction(rebuild_fts)?;
+    report.resolve = resolve::resolve_all(store)?;
     store.set_metadata("indexed_at", &crate::store::now_millis().to_string())?;
 
     report.elapsed = started.elapsed();

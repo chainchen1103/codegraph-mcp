@@ -22,12 +22,12 @@ struct Allocated<'a> {
 /// 排版整份結果。
 pub fn render(root: &Path, selection: &Selection, budget: Budget) -> String {
     if selection.hits.is_empty() {
-        return render_nothing_found(selection);
+        return not_found(selection);
     }
 
     let (allocated, omitted) = allocate(root, &selection.hits, budget);
     if allocated.is_empty() {
-        return render_nothing_found(selection);
+        return not_found(selection);
     }
 
     let mut out = String::new();
@@ -193,7 +193,8 @@ fn source_lines(root: &Path, hit: &Hit) -> Option<Vec<(u32, String)>> {
     if lines.is_empty() { None } else { Some(lines) }
 }
 
-fn render_nothing_found(selection: &Selection) -> String {
+/// 查無結果時的說明與候選名稱。
+pub fn not_found(selection: &Selection) -> String {
     let mut out = String::new();
     writeln!(out, "查無結果：{}", selection.unmatched.join("、")).ok();
 

@@ -20,6 +20,8 @@ pub struct FileWritten {
     pub symbols: usize,
     /// 因為 moniker 重複而未寫入的符號數。
     pub skipped: usize,
+    /// 寫入待解析佇列的引用數。
+    pub refs: usize,
 }
 
 /// 批次寫入器。
@@ -135,6 +137,35 @@ impl Writer {
             }
         }
 
+        written.refs = self.write_refs(conn, file_id, parse)?;
+        Ok(written)
+    }
+
+    /// 把引用寫進待解析佇列。
+    ///
+    /// 抽取階段只知道被呼叫者寫成什麼名字，對應到哪個符號要等整個
+    /// 專案都寫完才判斷得出來。
+    fn write_refs(&self, conn: &Connection, file_id: u32, parse: &FileParse) -> Result<usize> {
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO unresolved_refs(from_id, ref_name, rel, file_id, line, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+        )?;
+
+        let mut written = 0;
+        for reference in &parse.refs {
+            // 發出引用的符號一定在同一個檔案裡，剛才才 intern 過。
+            let Some(from_id) = self.monikers.get(&reference.from) else {
+                continue;
+            };
+            stmt.execute(rusqlite::params![
+                from_id,
+                reference.name,
+                reference.rel as u8,
+                file_id,
+                reference.line,
+            ])?;
+            written += 1;
+        }
         Ok(written)
     }
 

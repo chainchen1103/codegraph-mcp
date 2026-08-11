@@ -2,6 +2,7 @@
 //!
 //! 每個子命令回傳報告文字而不直接輸出，讓測試可以直接檢查內容。
 
+pub mod edges;
 pub mod explore;
 pub mod index;
 pub mod init;

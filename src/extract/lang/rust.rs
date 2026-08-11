@@ -9,7 +9,7 @@ use tree_sitter::{Language, Node};
 use super::super::ts;
 use super::super::{Extractor, FileParse};
 use crate::extract::moniker;
-use crate::model::{Kind, RawSymbol};
+use crate::model::{Kind, RawRef, RawSymbol, Rel};
 
 /// Rust 的文件註解前綴。
 const DOC_PREFIXES: &[&str] = &["///", "//!"];
@@ -105,7 +105,8 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
                     .unwrap_or_else(|| "impl".to_string());
                 descend(child, source, path, &scope.child(&name, true), out);
             }
-            // 不進入函數本體：巢狀函數無法從外部呼叫。
+            // 不把本體裡的巢狀函數當成符號，它們無法從外部呼叫，但本體
+            // 裡的呼叫仍要記錄下來。
             "function_item" | "function_signature_item" => {
                 let Some(name) = field_text(child, "name", source) else {
                     continue;
@@ -115,7 +116,10 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
                 } else {
                     Kind::Function
                 };
-                push(child, source, path, scope, kind, name, out);
+                let moniker = push(child, source, path, scope, kind, name, out);
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_calls(body, source, &moniker, out);
+                }
             }
             "struct_item" => leaf(child, source, path, scope, Kind::Struct, out),
             "enum_item" => leaf(child, source, path, scope, Kind::Enum, out),
@@ -140,6 +144,61 @@ fn leaf(node: Node<'_>, source: &str, path: &str, scope: &Scope, kind: Kind, out
     }
 }
 
+/// 走遍節點底下所有的呼叫，記到 `from` 名下。
+///
+/// 只記下被呼叫者在原始碼裡寫成什麼樣子，不做任何解析。巢狀函數與
+/// 閉包裡的呼叫都算在外層函數頭上，它們是同一段邏輯的一部分。
+fn collect_calls(node: Node<'_>, source: &str, from: &str, out: &mut FileParse) {
+    if node.kind() == "call_expression"
+        && let Some(name) = callee_name(node, source)
+    {
+        out.refs.push(RawRef {
+            from: from.to_string(),
+            name,
+            rel: Rel::Calls,
+            line: ts::line_of(node),
+        });
+    }
+
+    // 依原始碼順序遞迴，輸出才與檔案內容一致。
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_calls(child, source, from, out);
+    }
+}
+
+/// 被呼叫者在原始碼裡的寫法。
+///
+/// 保留原文，例如 `Store::open` 或 `store.stats`。解析階段依賴這兩點：
+/// 路徑越完整越容易對到唯一的符號；而寫法裡有沒有句點，決定了這是
+/// 對接收者呼叫方法，還是直接呼叫一個函數。
+fn callee_name(call: Node<'_>, source: &str) -> Option<String> {
+    let function = call.child_by_field_name("function")?;
+    callee_name_of(function, source)
+}
+
+fn callee_name_of(function: Node<'_>, source: &str) -> Option<String> {
+    match function.kind() {
+        // foo() 與 a::b::c()
+        "identifier" | "scoped_identifier" => Some(ts::text(function, source).to_string()),
+        // x.method()：連同接收者一起記下來。
+        "field_expression" => {
+            let field = function.child_by_field_name("field")?;
+            let receiver = function
+                .child_by_field_name("value")
+                .map(|v| ts::collapse_whitespace(ts::text(v, source)))
+                .unwrap_or_default();
+            Some(format!("{receiver}.{}", ts::text(field, source)))
+        }
+        // foo::<T>()
+        "generic_function" => function
+            .child_by_field_name("function")
+            .and_then(|inner| callee_name_of(inner, source)),
+        _ => None,
+    }
+}
+
+/// 收下一個符號，回傳它的 moniker。
 fn push(
     node: Node<'_>,
     source: &str,
@@ -148,12 +207,13 @@ fn push(
     kind: Kind,
     name: &str,
     out: &mut FileParse,
-) {
+) -> String {
     let start_line = ts::line_of(node);
     let qualified = scope.qualify(name);
+    let moniker = moniker::build(path, kind, name, start_line);
 
     out.symbols.push(RawSymbol {
-        moniker: moniker::build(path, kind, name, start_line),
+        moniker: moniker.clone(),
         name: name.to_string(),
         qualified,
         kind,
@@ -162,6 +222,8 @@ fn push(
         signature: signature(node, source),
         docstring: ts::leading_line_comments(node, source, "line_comment", DOC_PREFIXES, DOC_SKIP),
     });
+
+    moniker
 }
 
 /// 宣告的簽名，也就是本體之前的部分。
@@ -422,6 +484,96 @@ mod tests {
         let p = parse("");
         assert!(p.symbols.is_empty());
         assert!(p.errors.is_empty());
+    }
+
+    fn refs_of(p: &FileParse, from_name: &str) -> Vec<String> {
+        let from = p
+            .symbols
+            .iter()
+            .find(|s| s.name == from_name || s.qualified == from_name)
+            .unwrap_or_else(|| panic!("找不到 {from_name}"));
+        p.refs
+            .iter()
+            .filter(|r| r.from == from.moniker)
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn plain_calls_are_recorded_against_the_enclosing_function() {
+        let p = parse("fn caller() {\n    callee();\n}\n");
+
+        assert_eq!(refs_of(&p, "caller"), vec!["callee"]);
+        assert_eq!(p.refs[0].rel, Rel::Calls);
+        assert_eq!(p.refs[0].line, 2);
+    }
+
+    #[test]
+    fn qualified_calls_keep_their_full_path() {
+        let p = parse("fn caller() {\n    Store::open();\n    a::b::c();\n}\n");
+        assert_eq!(refs_of(&p, "caller"), vec!["Store::open", "a::b::c"]);
+    }
+
+    /// 方法呼叫連同接收者一起記下。句點的存在讓解析階段知道這是對某個
+    /// 值呼叫方法，而不是直接呼叫函數。
+    #[test]
+    fn method_calls_record_the_receiver_too() {
+        let p = parse("fn caller(s: Store) {\n    s.open();\n    self.close();\n}\n");
+        assert_eq!(refs_of(&p, "caller"), vec!["s.open", "self.close"]);
+    }
+
+    #[test]
+    fn turbofish_calls_are_recorded_by_name() {
+        let p = parse("fn caller() {\n    parse::<u8>();\n}\n");
+        assert_eq!(refs_of(&p, "caller"), vec!["parse"]);
+    }
+
+    #[test]
+    fn calls_inside_closures_belong_to_the_enclosing_function() {
+        let p = parse("fn caller() {\n    run(|| {\n        inner();\n    });\n}\n");
+        let refs = refs_of(&p, "caller");
+        assert!(refs.contains(&"run".to_string()), "{refs:?}");
+        assert!(refs.contains(&"inner".to_string()), "{refs:?}");
+    }
+
+    #[test]
+    fn calls_are_attributed_to_the_method_that_contains_them() {
+        let p = parse(
+            "struct S;\nimpl S {\n    fn a(&self) {\n        helper();\n    }\n    fn b(&self) {}\n}\n",
+        );
+
+        assert_eq!(refs_of(&p, "S::a"), vec!["helper"]);
+        assert!(refs_of(&p, "S::b").is_empty());
+    }
+
+    #[test]
+    fn chained_calls_are_all_recorded() {
+        let p = parse("fn caller() {\n    first().second().third();\n}\n");
+        let refs = refs_of(&p, "caller");
+        assert!(refs.iter().any(|r| r == "first"), "{refs:?}");
+        assert!(refs.iter().any(|r| r.ends_with(".second")), "{refs:?}");
+        assert!(refs.iter().any(|r| r.ends_with(".third")), "{refs:?}");
+    }
+
+    /// 巨集不是呼叫，語意由巨集展開決定，靜態解析看不到。
+    #[test]
+    fn macro_invocations_are_not_recorded_as_calls() {
+        let p = parse("fn caller() {\n    println!(\"hi\");\n    vec![1, 2];\n}\n");
+        assert!(refs_of(&p, "caller").is_empty(), "{:?}", p.refs);
+    }
+
+    #[test]
+    fn a_function_without_calls_produces_no_refs() {
+        let p = parse("fn quiet() {\n    let x = 1;\n}\n");
+        assert!(p.refs.is_empty());
+    }
+
+    #[test]
+    fn call_extraction_is_deterministic() {
+        let src = "fn caller() {\n    a();\n    b();\n    c();\n}\n";
+        let first: Vec<String> = parse(src).refs.into_iter().map(|r| r.name).collect();
+        let second: Vec<String> = parse(src).refs.into_iter().map(|r| r.name).collect();
+        assert_eq!(first, second);
     }
 
     #[test]

@@ -45,6 +45,24 @@ enum Command {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// 列出呼叫這個符號的地方
+    Callers {
+        /// 符號名或限定名
+        symbol: String,
+
+        /// 專案根目錄，預設從工作目錄往上尋找
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    /// 列出這個符號呼叫了哪些地方
+    Callees {
+        /// 符號名或限定名
+        symbol: String,
+
+        /// 專案根目錄，預設從工作目錄往上尋找
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
     /// 印出單一檔案的結構骨架
     Outline {
         /// 要分析的原始碼檔案
@@ -59,6 +77,12 @@ fn main() -> anyhow::Result<()> {
         Command::Init { path } => cli::init::run(path.as_deref())?,
         Command::Status { path } => cli::status::run(path.as_deref())?,
         Command::Explore { query, path } => cli::explore::run(&query.join(" "), path.as_deref())?,
+        Command::Callers { symbol, path } => {
+            cli::edges::run(&symbol, cli::edges::Direction::Callers, path.as_deref())?
+        }
+        Command::Callees { symbol, path } => {
+            cli::edges::run(&symbol, cli::edges::Direction::Callees, path.as_deref())?
+        }
         Command::Outline { file } => cli::outline::run(&file)?,
         Command::Index { path } => cli::index::run(path.as_deref())?,
     };

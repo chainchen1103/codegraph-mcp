@@ -7,9 +7,11 @@ pub mod cli;
 pub mod error;
 pub mod explore;
 pub mod extract;
+pub mod graph;
 pub mod indexer;
 pub mod model;
 pub mod project;
+pub mod resolve;
 pub mod store;
 
 pub use error::{CgError, NotIndexedReason, Result};
