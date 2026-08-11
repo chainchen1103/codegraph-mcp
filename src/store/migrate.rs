@@ -37,8 +37,20 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
+    // 既有的資料庫先調整既有物件，schema 才有辦法套用：新版的索引
+    // 可能建在 migration 才會加上的欄位上。全新的資料庫沒有這個問題，
+    // schema 一次就是最新版。
+    if found > 0 {
+        apply_migrations(conn, found)?;
+    }
+
     conn.execute_batch(SCHEMA)?;
-    apply_migrations(conn, found)?;
+
+    // 欄位變動後全文檢索的內容可能對不上，重建一次。
+    if found > 0 {
+        super::write::rebuild_fts(conn)?;
+    }
+
     record_version(conn, SCHEMA_VERSION)?;
     Ok(())
 }
@@ -77,19 +89,24 @@ fn has_user_objects(conn: &Connection) -> Result<bool> {
     Ok(n > 0)
 }
 
-/// 從 `from` 逐級升到最新版本。
+/// 把既有的資料庫從 `from` 逐級升到最新版本。
 ///
-/// 每新增一版就補一個分支。已發布的分支不可修改，使用者的資料庫會照
-/// 著執行。
+/// 只在既有資料庫上呼叫，`from` 至少為 1。每新增一版就補一個分支，
+/// 已發布的分支不可修改，使用者的資料庫會照著執行。
 fn apply_migrations(conn: &Connection, from: i64) -> Result<()> {
-    // 目前沒有任何一版需要額外的 SQL。
-    let _ = conn;
-
     let mut v = from;
     while v < SCHEMA_VERSION {
         match v {
-            // 0 到 1：schema.sql 已建立全部的表。
-            0 => {}
+            // 1 到 2：符號加上限定名。全文檢索的欄位跟著改變，舊的
+            // 虛擬表與 trigger 必須卸下，由後續的 schema 重新建立。
+            1 => conn.execute_batch(
+                "ALTER TABLE symbols ADD COLUMN qualified TEXT NOT NULL DEFAULT '';
+                 UPDATE symbols SET qualified = name WHERE qualified = '';
+                 DROP TRIGGER IF EXISTS symbols_ai;
+                 DROP TRIGGER IF EXISTS symbols_ad;
+                 DROP TRIGGER IF EXISTS symbols_au;
+                 DROP TABLE IF EXISTS symbols_fts;",
+            )?,
             other => {
                 return Err(CgError::Corrupt {
                     detail: format!("沒有從版本 {other} 升級的路徑"),
@@ -165,6 +182,87 @@ mod tests {
         assert!(matches!(err, CgError::Corrupt { .. }));
         assert!(!err.is_recoverable(), "版本不相容不是可回復的狀況");
         assert!(err.to_string().contains("升級"));
+    }
+
+    /// 第 1 版的資料庫：符號沒有限定名，全文檢索也少一個欄位。
+    fn version_one_database() -> Connection {
+        let conn = mem();
+        conn.execute_batch(
+            "CREATE TABLE schema_versions (
+                 version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL, note TEXT);
+             CREATE TABLE units (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                 export_hash TEXT NOT NULL DEFAULT '');
+             CREATE TABLE files (
+                 id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                 unit_id INTEGER NOT NULL REFERENCES units(id),
+                 is_test INTEGER NOT NULL DEFAULT 0,
+                 is_generated INTEGER NOT NULL DEFAULT 0,
+                 content_hash TEXT NOT NULL, indexed_at INTEGER NOT NULL);
+             CREATE TABLE symbols (
+                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind INTEGER NOT NULL,
+                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                 start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                 signature TEXT, docstring TEXT);
+             CREATE VIRTUAL TABLE symbols_fts USING fts5(
+                 name, signature, docstring, content='symbols', content_rowid='id');
+             INSERT INTO schema_versions(version, applied_at, note) VALUES (1, 0, 'v1');
+             INSERT INTO units(id, name) VALUES (1, 'root');
+             INSERT INTO files(id, path, unit_id, content_hash, indexed_at)
+                 VALUES (1, 'src/a.rs', 1, 'h', 0);
+             INSERT INTO symbols(id, name, kind, file_id, start_line, end_line)
+                 VALUES (1, 'open', 2, 1, 10, 20);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn an_existing_database_is_upgraded_in_place() {
+        let conn = version_one_database();
+        migrate(&conn).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        // 既有的資料留著，新欄位以原本的名字補上。
+        let (name, qualified): (String, String) = conn
+            .query_row(
+                "SELECT name, qualified FROM symbols WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, "open");
+        assert_eq!(qualified, "open", "舊資料沒有回填限定名");
+    }
+
+    #[test]
+    fn upgrading_rebuilds_the_full_text_index_with_the_new_columns() {
+        let conn = version_one_database();
+        migrate(&conn).unwrap();
+
+        conn.execute(
+            "UPDATE symbols SET qualified = 'Store::open' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM symbols_fts WHERE symbols_fts MATCH 'Store'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "升級後的全文檢索沒有涵蓋新欄位");
+    }
+
+    #[test]
+    fn upgrading_twice_is_a_no_op() {
+        let conn = version_one_database();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     /// 指向別的工具的資料庫時必須拒絕，而不是把索引用的表加進去。

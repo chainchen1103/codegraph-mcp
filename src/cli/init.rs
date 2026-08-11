@@ -37,6 +37,10 @@ pub fn run(path: Option<&Path>) -> Result<String> {
 mod tests {
     use super::*;
 
+    fn code_graph_schema_version() -> i64 {
+        crate::store::SCHEMA_VERSION
+    }
+
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("codegraph-init-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -50,7 +54,7 @@ mod tests {
         let out = run(Some(&root)).unwrap();
 
         assert!(out.contains("已建立索引目錄"));
-        assert!(out.contains("schema    v1"));
+        assert!(out.contains(&format!("schema    v{}", code_graph_schema_version())));
 
         let project = Project::discover(&root).unwrap();
         assert!(project.db_path().is_file(), "沒有建立資料庫檔案");

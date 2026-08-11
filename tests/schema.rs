@@ -36,12 +36,15 @@ fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 
+/// schema.sql 只建表，版本列由 migrate 寫入。直接套用 schema 的資料庫
+/// 版本表是空的，`Store::open` 才有辦法分辨「全新」與「已建好」。
 #[test]
-fn schema_version_constant_is_recorded_by_migrations_not_by_the_schema_file() {
+fn the_schema_file_does_not_record_a_version_itself() {
     let conn = fresh_db();
-    // schema.sql 只建表，版本列由 migrate 寫入。
     assert_eq!(count(&conn, "SELECT count(*) FROM schema_versions"), 0);
-    assert_eq!(SCHEMA_VERSION, 1);
+
+    let store = code_graph::store::Store::in_memory().unwrap();
+    assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 }
 
 #[test]

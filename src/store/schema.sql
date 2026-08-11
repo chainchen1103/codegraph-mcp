@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS units (
 CREATE TABLE IF NOT EXISTS symbols (
     id         INTEGER PRIMARY KEY,
     name       TEXT NOT NULL,
+    -- 含容器的名字，例如 Store::open。查詢與輸出都以它為主。
+    qualified  TEXT NOT NULL DEFAULT '',
     kind       INTEGER NOT NULL,
     file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     start_line INTEGER NOT NULL,
@@ -121,25 +123,25 @@ CREATE TABLE IF NOT EXISTS tombstones (
 -- INSERT INTO symbols_fts(symbols_fts) VALUES('rebuild')，增量寫入則
 -- 依賴下列 trigger。兩者皆缺時搜尋結果會過時且不會報錯。
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-    name, signature, docstring,
+    name, qualified, signature, docstring,
     content='symbols', content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-    INSERT INTO symbols_fts(rowid, name, signature, docstring)
-    VALUES (new.id, new.name, new.signature, new.docstring);
+    INSERT INTO symbols_fts(rowid, name, qualified, signature, docstring)
+    VALUES (new.id, new.name, new.qualified, new.signature, new.docstring);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, docstring)
-    VALUES ('delete', old.id, old.name, old.signature, old.docstring);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified, signature, docstring)
+    VALUES ('delete', old.id, old.name, old.qualified, old.signature, old.docstring);
 END;
 
 CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
-    INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, docstring)
-    VALUES ('delete', old.id, old.name, old.signature, old.docstring);
-    INSERT INTO symbols_fts(rowid, name, signature, docstring)
-    VALUES (new.id, new.name, new.signature, new.docstring);
+    INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified, signature, docstring)
+    VALUES ('delete', old.id, old.name, old.qualified, old.signature, old.docstring);
+    INSERT INTO symbols_fts(rowid, name, qualified, signature, docstring)
+    VALUES (new.id, new.name, new.qualified, new.signature, new.docstring);
 END;
 
 -- ============================================================
@@ -150,6 +152,7 @@ END;
 CREATE INDEX IF NOT EXISTS idx_relations_dst  ON relations(dst, rel);
 CREATE INDEX IF NOT EXISTS idx_symbols_file   ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_name   ON symbols(name);
+CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified);
 CREATE INDEX IF NOT EXISTS idx_files_unit     ON files(unit_id);
 -- 部分索引：只有待重試的列會被掃到。
 CREATE INDEX IF NOT EXISTS idx_unresolved_tail
