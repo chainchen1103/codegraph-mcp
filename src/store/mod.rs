@@ -21,6 +21,7 @@ pub const SCHEMA_VERSION: i64 = 1;
 const PAGE_SIZE: i64 = 4096;
 
 /// 一個開啟中的索引資料庫。
+#[derive(Debug)]
 pub struct Store {
     conn: Connection,
 }
@@ -224,6 +225,37 @@ mod tests {
             .query_row("PRAGMA page_size", [], |r| r.get(0))
             .unwrap();
         assert_eq!(size, PAGE_SIZE);
+    }
+
+    /// 路徑上已有別的資料庫時，開啟必須失敗而不是把索引表加進去。
+    #[test]
+    fn opening_a_foreign_database_is_refused() {
+        let dir = std::env::temp_dir().join(format!("codegraph-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("graph.db");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE unrelated(id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+
+        let err = Store::open(&path).unwrap_err();
+        assert!(matches!(err, crate::error::CgError::Corrupt { .. }));
+
+        let conn = Connection::open(&path).unwrap();
+        let ours: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='symbols'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ours, 0, "被拒絕的資料庫仍然被寫入了索引用的表");
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

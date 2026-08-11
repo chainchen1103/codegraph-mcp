@@ -12,7 +12,17 @@ use crate::error::{CgError, Result};
 ///
 /// 版本相同時不做任何事。版本較新時回 [`CgError::Corrupt`]：以舊程式
 /// 讀取新 schema 會取到不完整的資料，SQLite 不會回報錯誤。
+///
+/// 已有內容但不屬於 codegraph 的資料庫同樣會被拒絕，避免把索引用的表
+/// 建到別的檔案裡。
 pub fn migrate(conn: &Connection) -> Result<()> {
+    if !has_version_table(conn)? && has_user_objects(conn)? {
+        return Err(CgError::Corrupt {
+            detail: "這個檔案已有內容，但不是 codegraph 索引。請換一個路徑，或先移除該檔案"
+                .to_string(),
+        });
+    }
+
     let found = current_version(conn)?;
 
     if found > SCHEMA_VERSION {
@@ -35,19 +45,36 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
 /// 資料庫目前的 schema 版本。全新的資料庫回 0。
 pub fn current_version(conn: &Connection) -> Result<i64> {
-    let has_table: bool = conn.query_row(
-        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_versions'",
-        [],
-        |r| r.get::<_, i64>(0),
-    )? > 0;
-
-    if !has_table {
+    if !has_version_table(conn)? {
         return Ok(0);
     }
 
     let version: Option<i64> =
         conn.query_row("SELECT max(version) FROM schema_versions", [], |r| r.get(0))?;
     Ok(version.unwrap_or(0))
+}
+
+/// 是否存在版本表。它的存在即代表這個檔案是 codegraph 索引。
+fn has_version_table(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_versions'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// 資料庫是否已有使用者建立的物件。
+///
+/// 只看 `sqlite_master`，SQLite 自己的內部物件以 `sqlite_` 開頭，排除
+/// 在外。
+fn has_user_objects(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// 從 `from` 逐級升到最新版本。
@@ -138,6 +165,51 @@ mod tests {
         assert!(matches!(err, CgError::Corrupt { .. }));
         assert!(!err.is_recoverable(), "版本不相容不是可回復的狀況");
         assert!(err.to_string().contains("升級"));
+    }
+
+    /// 指向別的工具的資料庫時必須拒絕，而不是把索引用的表加進去。
+    #[test]
+    fn a_database_that_is_not_ours_is_refused() {
+        let conn = mem();
+        conn.execute_batch("CREATE TABLE unrelated(id INTEGER PRIMARY KEY, payload TEXT);")
+            .unwrap();
+
+        let err = migrate(&conn).unwrap_err();
+        assert!(matches!(err, CgError::Corrupt { .. }));
+        assert!(!err.is_recoverable());
+
+        let ours: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='symbols'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ours, 0, "被拒絕的資料庫仍然被寫入了索引用的表");
+    }
+
+    /// 前一次建立中途失敗時，版本表已存在但沒有版本列。這種情況要能
+    /// 續建，不能誤判成別人的資料庫。
+    #[test]
+    fn a_half_created_index_is_completed_rather_than_refused() {
+        let conn = mem();
+        conn.execute_batch(SCHEMA).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 0);
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// 索引資料庫裡另外多了使用者自建的表時，不影響開啟。
+    #[test]
+    fn extra_tables_alongside_our_own_do_not_trigger_the_refusal() {
+        let conn = mem();
+        migrate(&conn).unwrap();
+        conn.execute_batch("CREATE TABLE scratch(id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
