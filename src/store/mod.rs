@@ -3,7 +3,9 @@
 //! SQL 只出現在這個模組底下。寫入使用單一連線，讀取端各自開啟自己的
 //! 連線。
 
+pub mod intern;
 pub mod migrate;
+pub mod write;
 
 use std::path::Path;
 
@@ -47,6 +49,18 @@ impl Store {
     /// 底層連線。
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// 在一個交易中執行 `f`。
+    ///
+    /// `f` 回傳錯誤時交易會回滾，資料庫停留在交易開始前的狀態。批次
+    /// 寫入必須走這個入口：中途失敗若留下一半的資料，查詢會安靜地少
+    /// 回結果。
+    pub fn with_transaction<T>(&mut self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let tx = self.conn.transaction()?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
     }
 
     /// 資料庫目前的 schema 版本。

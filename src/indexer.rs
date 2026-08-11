@@ -1,0 +1,291 @@
+//! 全量索引：走訪檔案、抽取符號、寫入資料庫。
+
+use std::time::{Duration, Instant};
+
+use crate::error::Result;
+use crate::extract;
+use crate::project::{Project, walk};
+use crate::store::Store;
+use crate::store::write::{Writer, rebuild_fts};
+
+/// 一次交易涵蓋的檔案數。
+///
+/// 交易太小會讓每個檔案都付出一次 fsync，太大則在中途失敗時損失較多
+/// 已完成的工作。
+const BATCH_FILES: usize = 500;
+
+/// 尚未支援多個編譯單元，全部檔案歸在同一個單元底下。
+const DEFAULT_UNIT: &str = "root";
+
+/// 一次索引的結果。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IndexReport {
+    /// 成功寫入的檔案數。
+    pub files: usize,
+    /// 寫入的符號數。
+    pub symbols: usize,
+    /// 因為 moniker 重複而未寫入的符號數。
+    pub skipped_symbols: usize,
+    /// 讀取失敗或語法有問題的檔案。
+    pub warnings: Vec<String>,
+    pub elapsed: Duration,
+}
+
+/// 重新索引整個專案。
+///
+/// 既有的索引內容會先清空。中途失敗時，已提交的批次會留在資料庫中，
+/// 重新執行即可覆蓋。
+pub fn index_project(project: &Project, store: &mut Store) -> Result<IndexReport> {
+    let started = Instant::now();
+    let files = walk::source_files(project);
+
+    let mut writer = Writer::new();
+    let mut report = IndexReport::default();
+
+    store.with_transaction(|conn| {
+        Writer::reset(conn)?;
+        writer.unit(conn, DEFAULT_UNIT)?;
+        Ok(())
+    })?;
+
+    for batch in files.chunks(BATCH_FILES) {
+        let mut parsed = Vec::with_capacity(batch.len());
+
+        for file in batch {
+            let absolute = file.absolute(project);
+            let bytes = match std::fs::read(&absolute) {
+                Ok(b) => b,
+                Err(e) => {
+                    report
+                        .warnings
+                        .push(format!("{}：讀取失敗，{e}", file.rel_path));
+                    continue;
+                }
+            };
+            let Ok(source) = String::from_utf8(bytes) else {
+                report
+                    .warnings
+                    .push(format!("{}：不是 UTF-8 文字檔", file.rel_path));
+                continue;
+            };
+            let Some(parse) = extract::extract(&file.rel_path, &source) else {
+                continue;
+            };
+
+            report.warnings.extend(parse.errors.iter().cloned());
+            parsed.push((
+                file.rel_path.clone(),
+                content_hash(source.as_bytes()),
+                parse,
+            ));
+        }
+
+        let written = store.with_transaction(|conn| {
+            let unit = writer.unit(conn, DEFAULT_UNIT)?;
+            let mut totals = (0usize, 0usize, 0usize);
+            for (rel_path, hash, parse) in &parsed {
+                let w = writer.write_file(conn, unit, rel_path, hash, parse)?;
+                totals.0 += 1;
+                totals.1 += w.symbols;
+                totals.2 += w.skipped;
+            }
+            Ok(totals)
+        })?;
+
+        report.files += written.0;
+        report.symbols += written.1;
+        report.skipped_symbols += written.2;
+    }
+
+    store.with_transaction(rebuild_fts)?;
+    store.set_metadata("indexed_at", &crate::store::now_millis().to_string())?;
+
+    report.elapsed = started.elapsed();
+    Ok(report)
+}
+
+/// 檔案內容的雜湊，用於之後跳過未變更的檔案。
+fn content_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex()[..32].to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_project(tag: &str) -> Project {
+        let dir =
+            std::env::temp_dir().join(format!("codegraph-indexer-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        Project::create(&dir).unwrap()
+    }
+
+    fn write(project: &Project, rel: &str, body: &str) {
+        let path = project.root().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn index(project: &Project) -> (IndexReport, Store) {
+        let mut store = Store::open(&project.db_path()).unwrap();
+        let report = index_project(project, &mut store).unwrap();
+        (report, store)
+    }
+
+    #[test]
+    fn indexing_writes_every_supported_file() {
+        let p = tmp_project("basic");
+        write(&p, "src/a.rs", "fn one() {}\nfn two() {}\n");
+        write(&p, "src/b.rs", "struct S;\n");
+        write(&p, "README.md", "# 不是原始碼\n");
+
+        let (report, store) = index(&p);
+        assert_eq!(report.files, 2);
+        assert_eq!(report.symbols, 3);
+        assert!(report.warnings.is_empty());
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.symbols, 3);
+
+        drop(store);
+        std::fs::remove_dir_all(p.root()).ok();
+    }
+
+    #[test]
+    fn reindexing_replaces_rather_than_accumulates() {
+        let p = tmp_project("reindex");
+        write(&p, "src/a.rs", "fn one() {}\n");
+
+        let (first, store) = index(&p);
+        drop(store);
+
+        let (second, store) = index(&p);
+        assert_eq!(first.symbols, second.symbols);
+        assert_eq!(store.stats().unwrap().symbols, 1, "重複索引把資料疊加了");
+
+        drop(store);
+        std::fs::remove_dir_all(p.root()).ok();
+    }
+
+    #[test]
+    fn deleted_files_disappear_from_the_index() {
+        let p = tmp_project("deleted");
+        write(&p, "src/a.rs", "fn one() {}\n");
+        write(&p, "src/b.rs", "fn two() {}\n");
+
+        let (_, store) = index(&p);
+        drop(store);
+
+        std::fs::remove_file(p.root().join("src/b.rs")).unwrap();
+        let (report, store) = index(&p);
+
+        assert_eq!(report.files, 1);
+        assert_eq!(store.stats().unwrap().symbols, 1);
+
+        drop(store);
+        std::fs::remove_dir_all(p.root()).ok();
+    }
+
+    #[test]
+    fn indexing_is_deterministic() {
+        let p = tmp_project("deterministic");
+        write(&p, "src/a.rs", "fn one() {}\n");
+        write(&p, "src/b.rs", "fn two() {}\n");
+
+        let snapshot = |store: &Store| -> Vec<(i64, String, i64)> {
+            let mut stmt = store
+                .conn()
+                .prepare("SELECT id, name, start_line FROM symbols ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        let (_, store) = index(&p);
+        let first = snapshot(&store);
+        drop(store);
+
+        let (_, store) = index(&p);
+        let second = snapshot(&store);
+
+        assert_eq!(first, second, "兩次索引配發了不同的識別碼");
+
+        drop(store);
+        std::fs::remove_dir_all(p.root()).ok();
+    }
+
+    #[test]
+    fn syntax_errors_are_reported_but_do_not_stop_the_run() {
+        let p = tmp_project("broken");
+        write(&p, "src/good.rs", "fn good() {}\n");
+        write(&p, "src/bad.rs", "fn broken( {\n");
+
+        let (report, store) = index(&p);
+        assert_eq!(report.files, 2);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("src/bad.rs")),
+            "語法錯誤沒有出現在警告裡：{:?}",
+            report.warnings
+        );
+        assert!(store.stats().unwrap().symbols >= 1);
+
+        drop(store);
+        std::fs::remove_dir_all(p.root()).ok();
+    }
+
+    #[test]
+    fn non_utf8_files_are_reported_and_skipped() {
+        let p = tmp_project("binary");
+        write(&p, "src/good.rs", "fn good() {}\n");
+        std::fs::write(p.root().join("src/bad.rs"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+        let (report, store) = index(&p);
+        assert_eq!(report.files, 1);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("UTF-8")),
+            "{:?}",
+            report.warnings
+        );
+
+        drop(store);
+        std::fs::remove_dir_all(p.root()).ok();
+    }
+
+    #[test]
+    fn an_empty_project_produces_an_empty_index() {
+        let p = tmp_project("empty");
+        let (report, store) = index(&p);
+
+        assert_eq!(report.files, 0);
+        assert_eq!(report.symbols, 0);
+        assert!(store.stats().unwrap().is_empty());
+
+        drop(store);
+        std::fs::remove_dir_all(p.root()).ok();
+    }
+
+    #[test]
+    fn the_index_records_when_it_was_built() {
+        let p = tmp_project("timestamp");
+        write(&p, "src/a.rs", "fn one() {}\n");
+
+        let (_, store) = index(&p);
+        let recorded = store.metadata("indexed_at").unwrap().unwrap();
+        assert!(recorded.parse::<i64>().unwrap() > 1_577_836_800_000);
+
+        drop(store);
+        std::fs::remove_dir_all(p.root()).ok();
+    }
+
+    #[test]
+    fn content_hashes_differ_for_different_content() {
+        assert_eq!(content_hash(b"same"), content_hash(b"same"));
+        assert_ne!(content_hash(b"one"), content_hash(b"two"));
+        assert_eq!(content_hash(b"x").len(), 32);
+    }
+}

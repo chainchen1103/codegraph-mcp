@@ -128,6 +128,40 @@ fn status_without_an_index_explains_itself() {
 }
 
 #[test]
+fn index_then_status_reports_real_numbers() {
+    let root = tmpdir("index");
+    let path = root.to_str().unwrap();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+
+    assert!(run(&["init", path]).0);
+
+    let (ok, stdout, stderr) = run(&["index", path]);
+    assert!(ok, "index 失敗：{stderr}");
+    assert!(stdout.contains("檔案      1"), "{stdout}");
+    assert!(stdout.contains("符號      2"), "{stdout}");
+
+    let (ok, stdout, _) = run(&["status", path]);
+    assert!(ok);
+    assert!(stdout.contains("符號      2"), "{stdout}");
+    assert!(!stdout.contains("索引是空的"), "{stdout}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn index_without_an_index_directory_explains_itself() {
+    let root = tmpdir("index-bare");
+    let (ok, _, stderr) = run(&["index", root.to_str().unwrap()]);
+
+    assert!(!ok);
+    assert!(stderr.contains(".codegraph"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn outline_prints_the_structure_of_a_file() {
     let root = tmpdir("outline");
     let file = root.join("a.rs");

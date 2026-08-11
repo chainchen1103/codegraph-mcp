@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
         Command::Init { path } => cli::init::run(path.as_deref())?,
         Command::Status { path } => cli::status::run(path.as_deref())?,
         Command::Outline { file } => cli::outline::run(&file)?,
-        Command::Index { path } => todo!("尚未實作：index {path:?}"),
+        Command::Index { path } => cli::index::run(path.as_deref())?,
     };
 
     print!("{report}");

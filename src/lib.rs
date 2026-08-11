@@ -6,12 +6,14 @@
 pub mod cli;
 pub mod error;
 pub mod extract;
+pub mod indexer;
 pub mod model;
 pub mod project;
 pub mod store;
 
 pub use error::{CgError, NotIndexedReason, Result};
 pub use extract::FileParse;
+pub use indexer::IndexReport;
 pub use model::{
     FileId, Kind, Provenance, RawRef, RawSymbol, Rel, Relation, Symbol, SymbolId, UnitId,
 };

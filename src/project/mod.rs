@@ -2,6 +2,8 @@
 //!
 //! 每個專案的索引放在根目錄底下的 `.codegraph/`，內含資料庫與設定檔。
 
+pub mod walk;
+
 use std::path::{Path, PathBuf};
 
 use crate::error::{CgError, Result};
