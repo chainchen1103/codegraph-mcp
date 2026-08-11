@@ -4,6 +4,7 @@
 //! 這樣測試可以直接斷言輸出內容，不必去解析 stdout；`main.rs` 只負責印。
 
 pub mod init;
+pub mod outline;
 pub mod status;
 
 use std::path::{Path, PathBuf};

@@ -7,11 +7,15 @@
 
 pub mod cli;
 pub mod error;
+pub mod extract;
 pub mod model;
 pub mod project;
 pub mod store;
 
 pub use error::{CgError, NotIndexedReason, Result};
-pub use model::{FileId, Kind, Provenance, RawRef, Rel, Relation, Symbol, SymbolId, UnitId};
+pub use extract::FileParse;
+pub use model::{
+    FileId, Kind, Provenance, RawRef, RawSymbol, Rel, Relation, Symbol, SymbolId, UnitId,
+};
 pub use project::Project;
 pub use store::{Stats, Store};

@@ -36,6 +36,11 @@ enum Command {
         /// 專案根目錄，預設從現在的工作目錄往上找 .codegraph/
         path: Option<PathBuf>,
     },
+    /// 印出單一檔案的結構骨架（不需要索引）
+    Outline {
+        /// 要分析的原始碼檔案
+        file: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -44,6 +49,7 @@ fn main() -> anyhow::Result<()> {
     let report = match cli.command {
         Command::Init { path } => cli::init::run(path.as_deref())?,
         Command::Status { path } => cli::status::run(path.as_deref())?,
+        Command::Outline { file } => cli::outline::run(&file)?,
         Command::Index { path } => todo!("Stage 3: cli::index（path = {path:?}）"),
     };
 

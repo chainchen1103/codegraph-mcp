@@ -172,13 +172,36 @@ pub struct Relation {
     pub meta: Option<String>,
 }
 
+/// 抽取階段產生的符號，**還沒有 id**。
+///
+/// 抽取層是純函數、不碰 DB，所以它拿不到 `SymbolId`／`FileId`
+/// ——那是 intern 之後才存在的東西（ARCHITECTURE.md §5.1）。
+/// 兩者之間的橋樑是 `moniker`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawSymbol {
+    /// 穩定識別碼。tree-sitter 路徑的組成是
+    /// `{相對路徑}:{kind}:{name}:{起始行}`（DESIGN.md §8.3）。
+    pub moniker: String,
+    /// 裸名字，例如 `open`。
+    pub name: String,
+    /// 帶容器的名字，例如 `Store::open`。查詢與輸出用。
+    pub qualified: String,
+    pub kind: Kind,
+    /// 1 起算。tree-sitter 的 row 是 0 起算，轉換在 extract 層做。
+    pub start_line: u32,
+    pub end_line: u32,
+    pub signature: Option<String>,
+    pub docstring: Option<String>,
+}
+
 /// 抽取階段產生、尚未解析成 `Relation` 的引用。
 ///
 /// 抽取層不做跨檔推論，只忠實記下「這裡引用了叫這個名字的東西」，
 /// 解析交給 resolve 層（ARCHITECTURE.md §6）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawRef {
-    pub from: SymbolId,
+    /// 發出這個引用的符號的 moniker。同樣還沒有 id。
+    pub from: String,
     /// 原文，例如 `"utils.greet"`。
     pub name: String,
     pub rel: Rel,
@@ -343,11 +366,24 @@ mod tests {
         assert!(synth.meta.is_some());
 
         let raw = RawRef {
-            from: SymbolId(1),
+            from: "src/a.rs:function:caller:1".into(),
             name: "utils.greet".into(),
             rel: Rel::Calls,
             line: 12,
         };
         assert_eq!(raw.name.rsplit('.').next(), Some("greet"));
+
+        let raw_sym = RawSymbol {
+            moniker: "src/a.rs:function:caller:1".into(),
+            name: "caller".into(),
+            qualified: "caller".into(),
+            kind: Kind::Function,
+            start_line: 1,
+            end_line: 5,
+            signature: Some("fn caller()".into()),
+            docstring: None,
+        };
+        // 抽取階段的產物必須靠 moniker 互相指涉，因為此時還沒有任何 id。
+        assert_eq!(raw.from, raw_sym.moniker);
     }
 }

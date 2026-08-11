@@ -248,18 +248,21 @@ fn raw_refs_land_in_unresolved_with_a_usable_name_tail() {
         },
     );
 
+    // 抽取階段只有 moniker，沒有 id。寫進 DB 前必須先 intern 成 id——
+    // 這裡直接對應到上面那個符號。
     let raw = RawRef {
-        from: SymbolId(1),
+        from: "src/a.rs:function:caller:1".into(),
         name: "utils.greet".into(),
         rel: Rel::Calls,
         line: 3,
     };
+    let from_id = SymbolId(1);
     let tail = raw.name.rsplit('.').next().unwrap().to_string();
 
     conn.execute(
         "INSERT INTO unresolved_refs(from_id, ref_name, name_tail, rel, file_id, line, status)
          VALUES (?1, ?2, ?3, ?4, 1, ?5, 1)",
-        rusqlite::params![raw.from.0, raw.name, tail, raw.rel as u8, raw.line],
+        rusqlite::params![from_id.0, raw.name, tail, raw.rel as u8, raw.line],
     )
     .unwrap();
 
