@@ -1,51 +1,43 @@
-//! 專案識別：找到 `.codegraph/` 在哪。
+//! 專案的定位與磁碟佈局。
 //!
-//! 磁碟佈局見 ARCHITECTURE.md §9。
+//! 每個專案的索引放在根目錄底下的 `.codegraph/`，內含資料庫與設定檔。
 
 use std::path::{Path, PathBuf};
 
 use crate::error::{CgError, Result};
 
-/// 索引目錄的名字。
+/// 索引目錄的名稱。
 pub const DIR_NAME: &str = ".codegraph";
 
-/// 本機可寫的現況圖。
+/// 索引資料庫的檔名。
 pub const DB_NAME: &str = "graph.db";
 
-/// 使用者設定。Stage 1 只產生範本，實際解析等到有設定要讀時再做
-/// （ignore 規則在 Stage 3）。
+/// 專案設定檔的檔名。
 pub const CONFIG_NAME: &str = "config.toml";
 
 const CONFIG_TEMPLATE: &str = "\
 # CodeGraph 專案設定
 #
-# 這個檔案目前只是範本——Stage 3（全量索引）才會開始讀它。
-# 屆時支援的項目：
-#   [index]  extra_ignore = [\"vendor/**\"]
-#   [budget] override = { max_chars = 30000 }
+# 目前僅為範本，尚未有選項被讀取。
 
 [index]
 extra_ignore = []
 ";
 
-/// 一個已經初始化的專案。
+/// 一個已建立索引目錄的專案。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Project {
-    /// 專案根目錄，也就是 `.codegraph/` 的上一層。
     root: PathBuf,
 }
 
 impl Project {
-    /// 從 `start` 往上找最近的 `.codegraph/`，**但不越過 repo 邊界**。
+    /// 從 `start` 逐層往上尋找索引目錄，遇到 repo 邊界即停止。
     ///
-    /// 邊界規則：走到含有 `.git` 的目錄就停（該層本身仍會檢查）。
-    /// 索引屬於某一個 repo；沒有這條界線的話，在一個未索引的專案裡執行
-    /// 就會一路往上撞到家目錄的 `.codegraph/`，然後拿**別的專案的圖**
-    /// 回答問題——而且不會有任何錯誤訊息。
+    /// 含有 `.git` 的目錄視為邊界，該層本身仍會檢查。索引隸屬於單一
+    /// repo，若不設邊界，未建立索引的專案會沿用上層目錄的索引，並以
+    /// 另一個專案的資料回答查詢。
     ///
-    /// 找不到**不是程式錯誤**：monorepo 中只有子專案有索引是常態，
-    /// 而且索引與否是使用者的決定。回 `NotIndexed`，由 MCP 層包成
-    /// 成功外殼加引導文字（DESIGN.md §5.3）。
+    /// 找不到索引時回 [`CgError::NotIndexed`]，屬於可回復的狀況。
     pub fn discover(start: &Path) -> Result<Self> {
         let start = normalize(start)?;
         for dir in start.ancestors() {
@@ -54,7 +46,7 @@ impl Project {
                     root: dir.to_path_buf(),
                 });
             }
-            // `.git` 可能是目錄，也可能是 worktree 的一個檔案。
+            // worktree 的 .git 是檔案而非目錄。
             if dir.join(".git").exists() {
                 break;
             }
@@ -62,8 +54,9 @@ impl Project {
         Err(CgError::NotIndexed { path: start })
     }
 
-    /// 在 `root` 建立 `.codegraph/`。已經存在則原樣回傳——
-    /// `init` 必須可以重複執行而不破壞既有索引。
+    /// 在 `root` 建立索引目錄與設定檔。
+    ///
+    /// 可重複呼叫。已存在的目錄與設定檔都不會被覆寫。
     pub fn create(root: &Path) -> Result<Self> {
         let root = normalize(root)?;
         let dir = root.join(DIR_NAME);
@@ -77,42 +70,45 @@ impl Project {
         Ok(Self { root })
     }
 
-    /// 這個路徑上（或其上層）是否已經有索引。
+    /// `root` 底下是否已有索引目錄。不會往上層尋找。
     pub fn is_initialized(root: &Path) -> bool {
         root.join(DIR_NAME).is_dir()
     }
 
+    /// 專案根目錄。
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// `.codegraph/` 本身。
+    /// 索引目錄的完整路徑。
     pub fn dir(&self) -> PathBuf {
         self.root.join(DIR_NAME)
     }
 
+    /// 索引資料庫的完整路徑。
     pub fn db_path(&self) -> PathBuf {
         self.dir().join(DB_NAME)
     }
 
+    /// 設定檔的完整路徑。
     pub fn config_path(&self) -> PathBuf {
         self.dir().join(CONFIG_NAME)
     }
 
-    /// 把絕對路徑轉成相對專案根目錄的形式。
+    /// 將路徑轉為相對專案根目錄的形式，超出範圍時回 `None`。
     ///
-    /// DB 裡一律存相對路徑——絕對路徑會把「誰的機器、放在哪個目錄」
-    /// 烙進索引，artifact 一換機器就全錯（DESIGN.md §1.1 的可分發前提）。
+    /// 資料庫一律儲存相對路徑，索引才能在不同機器之間共用。
     pub fn relativize<'a>(&self, path: &'a Path) -> Option<&'a Path> {
         path.strip_prefix(&self.root).ok()
     }
 }
 
-/// 盡量取得絕對路徑。路徑不存在時 `canonicalize` 會失敗，
-/// 此時退回「工作目錄 + 相對路徑」，讓錯誤訊息還是印得出完整路徑。
+/// 取得絕對路徑。
+///
+/// 路徑尚未存在時 `canonicalize` 會失敗，改以工作目錄補齊，讓錯誤訊息
+/// 仍能顯示完整路徑。
 fn normalize(path: &Path) -> Result<PathBuf> {
     if let Ok(p) = path.canonicalize() {
-        // Windows 的 canonicalize 會產生 \\?\ 前綴，印出來很醜，去掉。
         return Ok(strip_verbatim(p));
     }
     if path.is_absolute() {
@@ -121,6 +117,7 @@ fn normalize(path: &Path) -> Result<PathBuf> {
     Ok(std::env::current_dir()?.join(path))
 }
 
+/// 去除 Windows canonicalize 產生的 `\\?\` 前綴。
 fn strip_verbatim(p: PathBuf) -> PathBuf {
     let s = p.to_string_lossy();
     match s.strip_prefix(r"\\?\") {
@@ -133,11 +130,10 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// 建一個**帶 repo 邊界**的暫存目錄。
+    /// 建立帶有 repo 邊界的暫存目錄。
     ///
-    /// `.git` 是刻意放的：暫存目錄位在使用者家目錄底下，而家目錄可能
-    /// 真的有一個 `.codegraph/`（開發機上就有）。沒有邊界的話，
-    /// 「找不到索引」的測試會撞到那份索引而變成偶發性通過。
+    /// 暫存目錄位於使用者家目錄底下，而家目錄可能自己就有索引目錄。
+    /// 沒有 `.git` 邊界時，「找不到索引」的測試會撞到那份索引。
     fn tmpdir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "codegraph-project-{tag}-{}-{:?}",
@@ -210,8 +206,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// 索引屬於某一個 repo。上層 repo 的索引不該被下層的 repo 撿去用——
-    /// 拿別人的圖回答問題，比回答「沒有索引」糟得多。
     #[test]
     fn discover_stops_at_the_repo_boundary() {
         let outer = tmpdir("boundary");
@@ -226,7 +220,7 @@ mod tests {
             "往上找越過了 .git 邊界，撿到上層 repo 的索引"
         );
 
-        // 對照組：同一個位置若沒有 .git，就會沿用上層的索引。
+        // 同一個位置若沒有 .git，就會沿用上層的索引。
         std::fs::remove_dir_all(inner.join(".git")).unwrap();
         assert_eq!(
             Project::discover(&inner).unwrap().root(),
@@ -236,8 +230,6 @@ mod tests {
         std::fs::remove_dir_all(&outer).ok();
     }
 
-    /// 邊界那一層本身仍要被檢查——絕大多數專案的 `.codegraph/` 就是
-    /// 跟 `.git/` 放在同一層。
     #[test]
     fn discover_still_matches_at_the_boundary_directory_itself() {
         let root = tmpdir("at-boundary");

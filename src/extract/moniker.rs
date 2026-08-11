@@ -1,22 +1,16 @@
-//! 符號識別碼。
+//! 符號識別碼的組成規則。
 //!
-//! **穩定性要求（DESIGN.md §8.3）：改 function body 而不改簽名與起始行時，
-//! moniker 必須不變。** 滿足這條，單檔重解析後該符號的所有既有邊自動存活，
-//! 不需要任何 remap 機制。
+//! 格式為 `路徑:kind:name:起始行`。
 //!
-//! 組成：`{相對路徑}:{kind}:{name}:{起始行}`
-//!
-//! 為什麼含起始行：同一個檔案裡可以有兩個同名的東西（不同 impl 區塊的
-//! 同名方法、`#[cfg]` 分支的兩份實作）。行號是最便宜的消歧義鍵。
-//! 代價是「在檔案上方插入一行」會讓下方所有符號換 moniker——這是刻意的
-//! 取捨：那種編輯本來就會讓所有行號失效，重建比誤指更安全。
+//! 只修改函數內容而不動簽名與起始行時，識別碼保持不變，該符號既有的
+//! 邊在重新解析後仍然有效。行號用於區分同一檔案中的同名符號，代價是
+//! 在檔案上方插入內容會使下方符號的識別碼全部改變。
 
 use crate::model::Kind;
 
-/// 組出一個符號的 moniker。
+/// 組出符號的 moniker。
 ///
-/// `rel_path` 必須是相對專案根目錄、且用 `/` 當分隔符的路徑——
-/// Windows 的 `\` 會讓同一份 artifact 在不同平台產出不同的識別碼。
+/// `rel_path` 必須相對於專案根目錄。
 pub fn build(rel_path: &str, kind: Kind, name: &str, start_line: u32) -> String {
     format!(
         "{}:{}:{}:{}",
@@ -27,7 +21,9 @@ pub fn build(rel_path: &str, kind: Kind, name: &str, start_line: u32) -> String 
     )
 }
 
-/// 路徑正規化：反斜線換成斜線，去掉開頭的 `./`。
+/// 正規化路徑：反斜線轉為斜線，並去除開頭的 `./`。
+///
+/// 不同平台的分隔符必須收斂成同一種，索引才能跨平台共用。
 pub fn normalize_path(path: &str) -> String {
     let p = path.replace('\\', "/");
     p.strip_prefix("./").unwrap_or(&p).to_string()
@@ -45,8 +41,6 @@ mod tests {
         );
     }
 
-    /// 這是整個增量索引策略的地基：body 改了、簽名與行號沒改，
-    /// 識別碼就不變，該符號的所有 caller 邊自動存活。
     #[test]
     fn moniker_is_stable_across_body_edits() {
         let before = build("src/a.rs", Kind::Function, "process", 10);
@@ -63,8 +57,6 @@ mod tests {
         assert_ne!(base, build("src/a.rs", Kind::Function, "run", 11));
     }
 
-    /// 同一份 artifact 要能在 Windows 與 Linux 上讀出同樣的圖。
-    /// 路徑分隔符沒有正規化的話，兩邊的識別碼完全對不上。
     #[test]
     fn path_separators_are_normalised_across_platforms() {
         assert_eq!(

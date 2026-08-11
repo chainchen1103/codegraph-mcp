@@ -1,9 +1,7 @@
-//! CodeGraph —— 程式碼結構索引引擎。
+//! CodeGraph：程式碼結構索引引擎。
 //!
-//! 規格見 `DESIGN.md`，架構見 `ARCHITECTURE.md`，實作順序見 `IMPLEMENTATION.md`。
-//!
-//! 這個 crate 是**唯一的商業邏輯所在**。`main.rs`（CLI）與之後的 MCP server
-//! 都只是薄薄的介面層，不含邏輯——這樣兩個消費場景才會共用同一份行為。
+//! 這個 crate 包含全部的實作。CLI 與後續的服務介面都只負責解析輸入、
+//! 呼叫這裡的函數並輸出結果，兩者共用同一份行為。
 
 pub mod cli;
 pub mod error;

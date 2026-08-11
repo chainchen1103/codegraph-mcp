@@ -1,7 +1,6 @@
-//! `codegraph outline <file>` —— 單一檔案的結構骨架。
+//! `outline` 子命令：單一檔案的結構骨架。
 //!
-//! 不需要索引：抽取層是純函數，讀檔就能跑。這是 Stage 2 的驗收工具，
-//! 也是之後 `explore` 輸出的雛形。
+//! 抽取不需要資料庫，因此這個命令在尚未建立索引的專案也能使用。
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -10,6 +9,7 @@ use crate::error::{CgError, NotIndexedReason, Result};
 use crate::extract;
 use crate::project::Project;
 
+/// 分析 `file` 並回傳結構骨架。
 pub fn run(file: &Path) -> Result<String> {
     if !file.is_file() {
         return Err(CgError::FileNotIndexed {
@@ -18,8 +18,6 @@ pub fn run(file: &Path) -> Result<String> {
         });
     }
 
-    // moniker 用的是相對專案根目錄的路徑。不在任何專案裡（例如對著
-    // 隨手一個檔案跑）就退回原本給的路徑——抽取本身不需要專案。
     let rel = relative_path(file);
     let source = std::fs::read_to_string(file)?;
 
@@ -33,6 +31,7 @@ pub fn run(file: &Path) -> Result<String> {
     Ok(render(&rel, &parse))
 }
 
+/// 轉成相對專案根目錄的路徑，不在任何專案內時沿用原本的路徑。
 fn relative_path(file: &Path) -> String {
     let absolute = file.canonicalize();
     let candidate = absolute.as_deref().unwrap_or(file);
@@ -80,7 +79,7 @@ fn render(rel: &str, parse: &extract::FileParse) -> String {
     }
 
     if parse.symbols.is_empty() {
-        writeln!(out, "  （沒有抽到任何符號）").ok();
+        writeln!(out, "  沒有抽到任何符號").ok();
     }
 
     out
@@ -157,8 +156,6 @@ mod tests {
         assert!(err.is_recoverable());
     }
 
-    /// 在專案裡跑時，路徑要是相對根目錄的——絕對路徑會把
-    /// 「誰的機器」烙進 moniker。
     #[test]
     fn paths_are_reported_relative_to_the_project_root() {
         let out = run(Path::new("src/extract/lang/rust.rs")).unwrap();

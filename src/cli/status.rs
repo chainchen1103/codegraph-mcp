@@ -1,7 +1,4 @@
-//! `codegraph status` —— 索引現況與新鮮度。
-//!
-//! 這是使用者判斷「這份索引還能不能信」的唯一入口，
-//! 對應 MCP 回應裡的 `_meta`（DESIGN.md §4.3）。
+//! `status` 子命令：索引的規模與新鮮度。
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -10,6 +7,7 @@ use crate::error::Result;
 use crate::project::Project;
 use crate::store::Store;
 
+/// 顯示 `path` 所屬專案的索引狀態，未指定時使用工作目錄。
 pub fn run(path: Option<&Path>) -> Result<String> {
     let start = super::resolve_start(path)?;
     let project = Project::discover(&start)?;
@@ -37,7 +35,7 @@ pub fn run(path: Option<&Path>) -> Result<String> {
 
     match store.metadata("base_commit")? {
         Some(sha) => writeln!(out, "base      {sha}").ok(),
-        None => writeln!(out, "base      （尚未對應任何 commit）").ok(),
+        None => writeln!(out, "base      尚未對應任何 commit").ok(),
     };
 
     if stats.is_empty() {
@@ -48,6 +46,7 @@ pub fn run(path: Option<&Path>) -> Result<String> {
     Ok(out)
 }
 
+/// 資料庫檔案大小，讀不到時回 0。
 fn db_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
@@ -68,8 +67,7 @@ mod tests {
     use super::*;
     use crate::error::CgError;
 
-    /// `.git` 是 repo 邊界標記，讓「找不到索引」的測試不會往上撞到
-    /// 家目錄可能存在的 `.codegraph/`（見 `project::discover`）。
+    /// `.git` 作為 repo 邊界，避免測試往上找到家目錄的索引。
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("codegraph-status-{tag}-{}", std::process::id()));
@@ -127,7 +125,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// 沒索引過的目錄不是錯誤，是「還沒開始」。
     #[test]
     fn status_without_an_index_is_a_recoverable_condition() {
         let root = tmpdir("bare");

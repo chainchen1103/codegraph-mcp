@@ -1,10 +1,6 @@
-//! CLI 表面的契約（整合測試）。
+//! 命令列介面的整合測試。
 //!
-//! 直接跑編譯出來的 binary，不是呼叫 lib——`main.rs` 的參數解析、
-//! 結束碼、說明文字都是使用者真正會碰到的介面。
-//!
-//! Stage 0 的子命令還是 `todo!()`，所以這裡只驗證「解析層」的行為。
-//! 子命令真正的行為測試會隨著 Stage 1 / Stage 3 一起加。
+//! 直接執行編譯出來的執行檔，涵蓋參數解析、結束碼與輸出內容。
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -13,8 +9,7 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_codegraph"))
 }
 
-/// 帶 repo 邊界（`.git`）的暫存目錄——避免往上找索引時撞到
-/// 家目錄可能存在的 `.codegraph/`。
+/// 建立帶有 repo 邊界的暫存目錄，避免往上找到家目錄的索引。
 fn tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("codegraph-e2e-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -37,7 +32,7 @@ fn help_lists_every_subcommand() {
     assert!(out.status.success(), "--help 應該正常結束");
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for sub in ["init", "index", "status"] {
+    for sub in ["init", "index", "status", "outline"] {
         assert!(stdout.contains(sub), "說明裡少了子命令 `{sub}`：{stdout}");
     }
 }
@@ -53,7 +48,7 @@ fn version_is_reported() {
     );
 }
 
-/// 沒帶子命令是使用錯誤，不是崩潰。clap 用結束碼 2 表示這件事。
+/// 沒帶子命令屬於使用錯誤，clap 以結束碼 2 表示。
 #[test]
 fn missing_subcommand_is_a_usage_error_not_a_panic() {
     let out = bin().output().unwrap();
@@ -74,7 +69,6 @@ fn unknown_subcommand_is_rejected() {
     assert_eq!(out.status.code(), Some(2));
 }
 
-/// 每個子命令都接受一個選擇性的路徑參數。
 #[test]
 fn subcommands_accept_an_optional_path() {
     for sub in ["init", "index", "status"] {
@@ -88,7 +82,6 @@ fn subcommands_accept_an_optional_path() {
     }
 }
 
-/// 使用者真正會走的第一段路：init 之後 status 要看得到一個空索引。
 #[test]
 fn init_then_status_is_the_happy_path() {
     let root = tmpdir("happy");
@@ -108,7 +101,6 @@ fn init_then_status_is_the_happy_path() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// 重跑 init 是安全的，而且要說明自己什麼都沒做。
 #[test]
 fn init_twice_is_safe() {
     let root = tmpdir("twice");
@@ -122,8 +114,7 @@ fn init_twice_is_safe() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// 沒有索引的目錄：status 要以錯誤結束，但訊息必須是可行動的引導，
-/// 不是 panic 或 SQLite 的原始錯誤。
+/// 沒有索引時 status 以錯誤結束，訊息必須指出缺少什麼。
 #[test]
 fn status_without_an_index_explains_itself() {
     let root = tmpdir("bare");
@@ -132,6 +123,20 @@ fn status_without_an_index_explains_itself() {
     assert!(!ok, "沒有索引時 status 不該回報成功");
     assert!(stderr.contains(".codegraph"), "訊息要指出缺什麼：{stderr}");
     assert!(!stderr.contains("panicked"), "不該是 panic：{stderr}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn outline_prints_the_structure_of_a_file() {
+    let root = tmpdir("outline");
+    let file = root.join("a.rs");
+    std::fs::write(&file, "/// 說明\npub fn open() -> u8 {\n    1\n}\n").unwrap();
+
+    let (ok, stdout, stderr) = run(&["outline", file.to_str().unwrap()]);
+    assert!(ok, "outline 失敗：{stderr}");
+    assert!(stdout.contains("open"), "{stdout}");
+    assert!(stdout.contains("2-4"), "{stdout}");
 
     std::fs::remove_dir_all(&root).ok();
 }

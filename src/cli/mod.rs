@@ -1,7 +1,6 @@
 //! 子命令實作。
 //!
-//! 每個子命令都是 `run(...) -> Result<String>`：**回傳報告文字，不自己印**。
-//! 這樣測試可以直接斷言輸出內容，不必去解析 stdout；`main.rs` 只負責印。
+//! 每個子命令回傳報告文字而不直接輸出，讓測試可以直接檢查內容。
 
 pub mod init;
 pub mod outline;
@@ -11,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 
-/// 沒給路徑就用現在的工作目錄。
+/// 取得起始路徑，未指定時使用工作目錄。
 pub(crate) fn resolve_start(path: Option<&Path>) -> Result<PathBuf> {
     match path {
         Some(p) => Ok(p.to_path_buf()),

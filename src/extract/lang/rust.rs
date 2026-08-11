@@ -1,10 +1,8 @@
 //! Rust 抽取器。
 //!
-//! 用明確的遞迴走訪而不是 tree-sitter query（`.scm`）。原因：判斷
-//! 一個 `function_item` 是 function 還是 method，取決於它的祖先是不是
-//! `impl_item`／`trait_item`；容器名稱也要沿著祖先鏈累積（`a::b::c`）。
-//! 這種帶上下文的走訪用宣告式 query 表達很彆扭，一次明確的走訪反而
-//! 短、快、且好推理。
+//! 採用明確的遞迴走訪而非 tree-sitter query。函數與方法的區分取決於
+//! 祖先節點，容器名稱也需要沿祖先鏈累積，這類帶上下文的判斷用宣告式
+//! query 表達不便。
 
 use tree_sitter::{Language, Node};
 
@@ -15,6 +13,7 @@ use crate::model::{Kind, RawSymbol};
 
 /// Rust 的文件註解前綴。
 const DOC_PREFIXES: &[&str] = &["///", "//!"];
+
 /// 夾在文件註解與宣告之間、不打斷註解的節點。
 const DOC_SKIP: &[&str] = &["attribute_item"];
 
@@ -41,8 +40,7 @@ impl Extractor for RustExtractor {
         let mut out = FileParse::default();
         let root = tree.root_node();
         if root.has_error() {
-            // 不放棄已抽到的符號：編輯到一半的檔案本來就常常是壞的，
-            // 這時候能給出上半部的結構仍然有用。
+            // 編輯中的檔案經常暫時不合語法，仍然回傳已抽到的符號。
             out.errors
                 .push(format!("{rel_path}：有語法錯誤，結果可能不完整"));
         }
@@ -56,14 +54,11 @@ impl Extractor for RustExtractor {
 /// 走訪時攜帶的上下文。
 #[derive(Clone, Debug, Default)]
 struct Scope {
-    /// 祖先鏈上的名字（`["Store"]`、`["net", "http"]`），
-    /// 用來組出 `Store::open` 這種限定名。
+    /// 祖先鏈上的名字，用於組出限定名。
     container: Vec<String>,
-    /// 直屬容器是不是型別（`impl` / `trait`）。
+    /// 直屬容器是否為型別，也就是 `impl` 或 `trait`。
     ///
-    /// **這個旗標決定 function 還是 method。** 不能只看「有沒有容器」——
-    /// `mod tests { fn helper() }` 裡的 `helper` 是普通函數，不是方法。
-    /// 把它標成 method 會讓「這個型別有哪些方法」的查詢混進一堆模組層函數。
+    /// 決定函數要記成 function 還是 method。模組底下的函數不是方法。
     in_type: bool,
 }
 
@@ -83,12 +78,11 @@ impl Scope {
     }
 }
 
-/// 走訪一層，把找到的宣告收進 `out`。
+/// 走訪一層節點，把找到的宣告收進 `out`。
 fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileParse) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
-            // ---- 會產生符號、而且要往下走的容器 ----
             "mod_item" => {
                 let Some(name) = field_text(child, "name", source) else {
                     continue;
@@ -103,23 +97,19 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
                 push(child, source, path, scope, Kind::Trait, name, out);
                 descend(child, source, path, &scope.child(name, true), out);
             }
-            // ---- 只提供上下文、本身不是符號 ----
+            // impl 區塊本身不是符號，只提供方法所屬的型別。
             "impl_item" => {
-                // `impl Foo` 與 `impl Trait for Foo` 都取 `type`，
-                // 也就是「方法掛在誰身上」。
                 let name = child
                     .child_by_field_name("type")
                     .map(|n| type_base_name(n, source))
                     .unwrap_or_else(|| "impl".to_string());
                 descend(child, source, path, &scope.child(&name, true), out);
             }
-            // ---- 葉節點 ----
+            // 不進入函數本體：巢狀函數無法從外部呼叫。
             "function_item" | "function_signature_item" => {
                 let Some(name) = field_text(child, "name", source) else {
                     continue;
                 };
-                // **不往 body 裡走**：巢狀 fn 是實作細節，外面叫不到它，
-                // 收進圖裡只會稀釋查詢結果。
                 let kind = if scope.in_type {
                     Kind::Method
                 } else {
@@ -137,7 +127,7 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
     }
 }
 
-/// 走進容器的 body。沒有 body（例如 `mod foo;`）就什麼都不做。
+/// 走進容器的本體，沒有本體時不做任何事。
 fn descend(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileParse) {
     if let Some(body) = node.child_by_field_name("body") {
         walk(body, source, path, scope, out);
@@ -174,10 +164,7 @@ fn push(
     });
 }
 
-/// 宣告的簽名：從宣告開頭到 body 之前。
-///
-/// 只回宣告部分是為了**簽名**這個用途，不是為了省 token——完整 body
-/// 由 `explore` 直接讀原始碼給出（DESIGN.md §5.1）。
+/// 宣告的簽名，也就是本體之前的部分。
 fn signature(node: Node<'_>, source: &str) -> Option<String> {
     let full = ts::text(node, source);
     let cut = node
@@ -196,26 +183,21 @@ fn field_text<'a>(node: Node<'_>, field: &str, source: &'a str) -> Option<&'a st
     node.child_by_field_name(field).map(|n| ts::text(n, source))
 }
 
-/// 型別運算式剝到只剩基底名字。
+/// 取得型別運算式的基底名稱。
 ///
-/// `impl<T> Widget<T>`、`impl Display for Widget<u8>`、`impl crate::a::Widget`
-/// 講的都是同一個型別。不剝掉泛型參數與模組路徑的話，同一個型別的方法
-/// 會被拆成 `Widget<T>::new`、`Widget<u8>::fmt`、`crate::a::Widget::x`
-/// 三組互不相干的限定名，「這個型別有哪些方法」就永遠問不到完整答案。
+/// `Widget<T>`、`crate::a::Widget`、`&Widget` 指的都是同一個型別。不
+/// 收斂成同一個名字，同一型別的方法會散落在多組限定名之下。
 fn type_base_name(node: Node<'_>, source: &str) -> String {
     match node.kind() {
-        // Widget<T> → Widget
         "generic_type" => node
             .child_by_field_name("type")
             .map(|n| type_base_name(n, source))
             .unwrap_or_else(|| ts::text(node, source).to_string()),
-        // a::b::Widget → Widget
         "scoped_type_identifier" => node
             .child_by_field_name("name")
             .map(|n| ts::text(n, source).to_string())
             .unwrap_or_else(|| ts::text(node, source).to_string()),
-        // &T / *const T / [T; N] 之類的包裝。
-        // 欄位名依節點種類而異：參考與指標是 `type`，陣列是 `element`。
+        // 參考與指標的內層欄位是 type，陣列是 element。
         "reference_type" | "pointer_type" | "array_type" | "slice_type" => node
             .child_by_field_name("type")
             .or_else(|| node.child_by_field_name("element"))
@@ -274,11 +256,9 @@ mod tests {
         let m = find(&p, "S::open");
         assert_eq!(m.kind, Kind::Method);
         assert_eq!(m.name, "open");
-        // impl 區塊本身不是符號——它只是「這些方法掛在誰身上」的資訊。
-        assert!(!names(&p).contains(&"impl"));
+        assert!(!names(&p).contains(&"impl"), "impl 區塊本身不該是符號");
     }
 
-    /// 泛型參數與模組路徑都要剝掉，否則同一個型別的方法會被拆成好幾組。
     #[test]
     fn every_impl_of_a_type_lands_under_the_same_name() {
         let p = parse(
@@ -298,7 +278,6 @@ mod tests {
         );
     }
 
-    /// `impl Trait for &T` / `for [T; N]` 這些包裝型別也要剝到基底名字。
     #[test]
     fn wrapper_types_in_impl_targets_are_unwrapped() {
         let p = parse(
@@ -313,8 +292,6 @@ mod tests {
         }
     }
 
-    /// 匿名 impl（`impl Trait for (u8, u8)` 這種沒有基底名字的目標）
-    /// 不能讓走訪爆掉，方法照樣要抽到。
     #[test]
     fn an_impl_on_an_unnamed_target_still_yields_its_methods() {
         let p = parse("impl Marker for (u8, u8) {\n    fn tupled() {}\n}\n");
@@ -332,7 +309,6 @@ mod tests {
     #[test]
     fn trait_impls_attribute_methods_to_the_type_not_the_trait() {
         let p = parse("struct S;\nimpl std::fmt::Display for S {\n    fn fmt() {}\n}\n");
-        // 問「S 有哪些方法」比問「Display 有哪些實作」常見得多。
         assert!(names(&p).contains(&"S::fmt"), "{:?}", names(&p));
     }
 
@@ -342,9 +318,6 @@ mod tests {
         assert!(names(&p).contains(&"a::b::c"), "{:?}", names(&p));
     }
 
-    /// 模組裡的函數是**函數**，不是方法。只有 impl／trait 底下的才是方法。
-    /// 混淆的話，「這個型別有哪些方法」會混進一堆模組層的函數——
-    /// `mod tests` 底下那幾十個測試就是最明顯的受害者。
     #[test]
     fn functions_in_modules_are_not_methods() {
         let p =
@@ -353,7 +326,6 @@ mod tests {
         assert_eq!(find(&p, "S::m").kind, Kind::Method);
     }
 
-    /// `impl` 區塊裡的模組（罕見但合法）不該把方法身分傳染下去。
     #[test]
     fn a_module_inside_a_type_resets_the_method_context() {
         let p = parse("trait T {\n    fn required(&self);\n}\nmod m {\n    fn plain() {}\n}\n");
@@ -361,7 +333,6 @@ mod tests {
         assert_eq!(find(&p, "m::plain").kind, Kind::Function);
     }
 
-    /// `mod foo;` 沒有 body，走訪不能因此爆掉。
     #[test]
     fn a_module_declaration_without_a_body_is_fine() {
         let p = parse("mod other;\nfn f() {}\n");
@@ -377,7 +348,6 @@ mod tests {
         assert_eq!(m.signature.as_deref(), Some("fn required(&self) -> u8;"));
     }
 
-    /// 巢狀 fn 是實作細節，外面叫不到——收進圖只會稀釋查詢結果。
     #[test]
     fn functions_nested_inside_bodies_are_ignored() {
         let p = parse("fn outer() {\n    fn inner() {}\n}\n");
@@ -416,8 +386,6 @@ mod tests {
         );
     }
 
-    /// `#[derive(...)]` 長在文件註解與宣告之間。不跳過的話，
-    /// 所有帶屬性的型別都會抓不到文件——也就是大部分的型別。
     #[test]
     fn attributes_do_not_hide_doc_comments() {
         let p = parse("/// 說明\n#[derive(Debug, Clone)]\n#[non_exhaustive]\nstruct S;\n");
@@ -442,7 +410,6 @@ mod tests {
         assert_eq!(find(&p, "f").moniker, "src/a.rs:function:f:1");
     }
 
-    /// 語法壞掉的檔案要回報問題，但**仍然交出抽得到的符號**。
     #[test]
     fn a_broken_file_still_yields_what_it_can() {
         let p = parse("fn good() {}\nfn broken( { \n");
@@ -459,12 +426,12 @@ mod tests {
 
     #[test]
     fn extraction_order_is_deterministic() {
-        // 確定性排序是 prompt caching 命中率的前提（DESIGN.md §5.5）。
         let src = "fn b() {}\nfn a() {}\nstruct C;\n";
         let first: Vec<String> = parse(src).symbols.into_iter().map(|s| s.moniker).collect();
         let second: Vec<String> = parse(src).symbols.into_iter().map(|s| s.moniker).collect();
         assert_eq!(first, second);
-        // 依原始碼出現順序，不是字母序。
+
+        // 依原始碼出現順序，不是字母順序。
         assert_eq!(
             first,
             vec![

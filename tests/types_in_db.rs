@@ -1,8 +1,7 @@
-//! 型別與 DB 表示法之間的往返契約（整合測試）。
+//! 型別與資料庫表示法之間的往返測試。
 //!
-//! `Kind` / `Rel` / `Provenance` 在 Rust 端是 enum，在 DB 裡是 integer。
-//! 兩邊的對應一旦漂移，讀出來的圖就是錯的——而且不會有任何錯誤訊息，
-//! 只會安靜地把 function 當成 class。這組測試把對應釘死。
+//! `Kind`、`Rel`、`Provenance` 在 Rust 端是列舉，在資料庫中是整數。
+//! 兩邊的對應一旦不一致，讀出來的圖會是錯的，而且不會產生任何錯誤。
 
 use code_graph::store::SCHEMA;
 use code_graph::{FileId, Kind, Provenance, RawRef, Rel, Relation, Symbol, SymbolId};
@@ -49,7 +48,7 @@ fn load_symbol(conn: &Connection, id: SymbolId) -> Symbol {
             Ok(Symbol {
                 id: SymbolId(r.get(0)?),
                 name: r.get(1)?,
-                // 未知的 kind 不猜——代表這份 DB 是更新版 schema 寫的。
+                // 未知的 kind 表示資料庫由較新的 schema 寫入，不做推測。
                 kind: Kind::from_u8(raw_kind)
                     .unwrap_or_else(|| panic!("DB 裡有未知的 kind: {raw_kind}")),
                 file: FileId(r.get(3)?),
@@ -224,13 +223,13 @@ fn every_rel_and_provenance_survives_a_round_trip() {
             assert!(meta.is_none(), "靜態邊不該帶合成器資訊");
         } else {
             assert_eq!(*prov, Provenance::Heuristic);
-            assert!(meta.is_some(), "合成邊一定要記錄來源（DESIGN.md §7.3）");
+            assert!(meta.is_some(), "合成的邊必須記錄來源");
         }
     }
 }
 
-/// `RawRef` 是抽取層的產物，會被寫進 `unresolved_refs` 等待解析。
-/// `name_tail` 是重試查找的鍵（DESIGN.md §4.2）。
+/// `RawRef` 會寫進 `unresolved_refs` 等待解析，`name_tail` 是重試時的
+/// 查找鍵。
 #[test]
 fn raw_refs_land_in_unresolved_with_a_usable_name_tail() {
     let conn = db_with_one_file();
@@ -248,8 +247,7 @@ fn raw_refs_land_in_unresolved_with_a_usable_name_tail() {
         },
     );
 
-    // 抽取階段只有 moniker，沒有 id。寫進 DB 前必須先 intern 成 id——
-    // 這裡直接對應到上面那個符號。
+    // 抽取階段只有 moniker，寫入前必須先 intern 成識別碼。
     let raw = RawRef {
         from: "src/a.rs:function:caller:1".into(),
         name: "utils.greet".into(),
@@ -266,7 +264,7 @@ fn raw_refs_land_in_unresolved_with_a_usable_name_tail() {
     )
     .unwrap();
 
-    // 重試查找：新符號叫 greet，要能靠 name_tail 找回這條待解析的引用。
+    // 新符號名為 greet 時，要能靠 name_tail 找回這條待解析的引用。
     let found: i64 = conn
         .query_row(
             "SELECT count(*) FROM unresolved_refs WHERE status = 1 AND name_tail = 'greet'",

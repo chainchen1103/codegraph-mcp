@@ -1,8 +1,6 @@
-//! 語言註冊表。
+//! 語言抽取器的註冊表。
 //!
-//! 加一個語言 = **新增一個檔案 + 在這裡加一行**。若某次新增語言需要
-//! 改動 `extract/` 以外的地方，代表抽象漏了，該回頭修 `Extractor` trait
-//! 而不是把特例塞進呼叫端（IMPLEMENTATION.md Stage 10）。
+//! 新增一個語言只需新增一個模組並在 [`all`] 加入一項。
 
 pub mod rust;
 
@@ -11,7 +9,7 @@ fn all() -> &'static [&'static dyn super::Extractor] {
     &[&rust::RustExtractor]
 }
 
-/// 依副檔名（不含點）找抽取器。
+/// 依副檔名取得抽取器，副檔名不含點。
 pub fn by_extension(ext: &str) -> Option<&'static dyn super::Extractor> {
     all()
         .iter()
@@ -19,7 +17,7 @@ pub fn by_extension(ext: &str) -> Option<&'static dyn super::Extractor> {
         .find(|e| e.extensions().contains(&ext))
 }
 
-/// 已支援的語言名稱，`status` 與文件用。
+/// 已支援的語言名稱。
 pub fn languages() -> Vec<&'static str> {
     all().iter().map(|e| e.language()).collect()
 }
@@ -30,8 +28,7 @@ mod tests {
 
     #[test]
     fn extensions_map_to_exactly_one_extractor() {
-        // 兩個抽取器搶同一個副檔名的話，`by_extension` 的結果會取決於
-        // 註冊順序——這種 bug 只會在加第三、第四個語言時冒出來。
+        // 副檔名重複時，查詢結果會取決於註冊順序。
         let mut seen: Vec<&str> = Vec::new();
         for e in all() {
             for ext in e.extensions() {
@@ -46,7 +43,7 @@ mod tests {
     fn lookup_is_by_bare_extension() {
         assert!(by_extension("rs").is_some());
         assert!(by_extension(".rs").is_none(), "副檔名不應該帶點");
-        assert!(by_extension("py").is_none(), "Python 還沒實作");
+        assert!(by_extension("py").is_none());
     }
 
     #[test]

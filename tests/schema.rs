@@ -1,18 +1,17 @@
-//! Schema 的行為契約（整合測試）。
+//! schema 的行為契約。
 //!
-//! 這些測試跑真的 SQLite、真的檔案，不 mock——這個專案的 bug 大多出在
-//! SQL 與交易邊界，mock 掉等於沒測（ARCHITECTURE.md §10）。
+//! 這些測試對真實的 SQLite 執行，不使用替身。專案的問題多半出在 SQL
+//! 與交易邊界上。
 
 use std::path::PathBuf;
 
 use code_graph::store::{SCHEMA, SCHEMA_VERSION};
 use rusqlite::Connection;
 
-/// 建一個套好 schema 的記憶體 DB，並開啟外鍵約束。
+/// 建立一個套用好 schema 並開啟外鍵約束的記憶體資料庫。
 ///
-/// `foreign_keys` 預設是**關閉**的，這是 SQLite 的歷史包袱。
-/// 不開的話 `ON DELETE CASCADE` 完全不會生效，刪檔案會留下孤兒符號，
-/// 而且沒有任何錯誤。Stage 1 的 `Store::open` 必須把這個 pragma 寫死。
+/// `foreign_keys` 預設關閉，不開啟則 `ON DELETE CASCADE` 不會生效，
+/// 刪除檔案會留下孤兒符號且沒有錯誤訊息。
 fn fresh_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.pragma_update(None, "foreign_keys", true).unwrap();
@@ -20,7 +19,7 @@ fn fresh_db() -> Connection {
     conn
 }
 
-/// 塞一個最小可用的專案：一個單元、一個檔案、兩個符號。
+/// 塞入一個最小可用的專案：一個單元、一個檔案、兩個符號。
 fn seed(conn: &Connection) {
     conn.execute_batch(
         "INSERT INTO units(id, name) VALUES (1, 'root');
@@ -40,8 +39,7 @@ fn count(conn: &Connection, sql: &str) -> i64 {
 #[test]
 fn schema_version_constant_is_recorded_by_migrations_not_by_the_schema_file() {
     let conn = fresh_db();
-    // schema.sql 只建表，版本列是 migrate 的責任（Stage 1）。
-    // 這裡確認表在、且是空的——否則 migrate 會看到來路不明的版本。
+    // schema.sql 只建表，版本列由 migrate 寫入。
     assert_eq!(count(&conn, "SELECT count(*) FROM schema_versions"), 0);
     assert_eq!(SCHEMA_VERSION, 1);
 }
@@ -62,12 +60,12 @@ fn deleting_a_file_cascades_to_its_symbols_and_pending_refs() {
     assert_eq!(
         count(&conn, "SELECT count(*) FROM symbols"),
         0,
-        "刪檔案沒有連帶刪掉符號——孤兒符號會讓查詢回傳已經不存在的程式碼"
+        "刪檔案沒有連帶刪掉符號，查詢會回傳已不存在的程式碼"
     );
     assert_eq!(
         count(&conn, "SELECT count(*) FROM unresolved_refs"),
         0,
-        "unresolved_refs 沒有跟著 from_id 走"
+        "unresolved_refs 沒有跟著 from_id 刪除"
     );
 }
 
@@ -87,7 +85,7 @@ fn identical_edges_dedup_but_different_call_sites_survive() {
     let conn = fresh_db();
     seed(&conn);
 
-    // 同一個 caller 在第 3 行呼叫 callee，索引跑兩次。
+    // 同一個呼叫點索引兩次。
     for _ in 0..2 {
         conn.execute(
             "INSERT OR IGNORE INTO relations(src, dst, rel, line, file_id)
@@ -99,10 +97,10 @@ fn identical_edges_dedup_but_different_call_sites_survive() {
     assert_eq!(
         count(&conn, "SELECT count(*) FROM relations"),
         1,
-        "重複索引產生了重複的邊，會讓 caller 數量灌水"
+        "重複索引產生了重複的邊，caller 數量會灌水"
     );
 
-    // 同一對 src/dst，但在第 8 行又呼叫一次——這是不同的呼叫點，要保留。
+    // 同一組 src/dst，不同的呼叫點。
     conn.execute(
         "INSERT OR IGNORE INTO relations(src, dst, rel, line, file_id)
          VALUES (1, 2, 1, 8, 1)",
@@ -112,13 +110,12 @@ fn identical_edges_dedup_but_different_call_sites_survive() {
     assert_eq!(
         count(&conn, "SELECT count(*) FROM relations"),
         2,
-        "不同行的呼叫點被錯誤地折疊掉了——呼叫點上下文會遺失"
+        "不同行的呼叫點被折疊掉了"
     );
 }
 
-/// 合成邊沒有行號座標。若 `line` 可為 NULL，SQLite 會把每個 NULL 當成
-/// 相異值，主鍵就擋不住重複，兩次索引會產生兩列一樣的邊。
-/// 用 `NOT NULL DEFAULT -1` 就沒這個問題——這個測試釘住它。
+/// 沒有位置的邊以 -1 記錄。若使用 NULL，SQLite 視每個 NULL 為相異值，
+/// 主鍵擋不住重複。
 #[test]
 fn synthesized_edges_without_coordinates_still_dedup() {
     let conn = fresh_db();
@@ -144,7 +141,7 @@ fn synthesized_edges_without_coordinates_still_dedup() {
 fn tombstones_dedup_at_symbol_and_relation_granularity() {
     let conn = fresh_db();
 
-    // symbol 級 tombstone：dst / rel 不適用，落在預設的 -1。
+    // 符號層級的刪除標記，dst 與 rel 使用預設值。
     for _ in 0..2 {
         conn.execute(
             "INSERT OR IGNORE INTO tombstones(kind, src) VALUES (1, 42)",
@@ -152,7 +149,7 @@ fn tombstones_dedup_at_symbol_and_relation_granularity() {
         )
         .unwrap();
     }
-    // relation 級 tombstone：同一個 src 但完整指定，是不同的一列。
+    // 邊層級的刪除標記，即使 src 相同也是另一列。
     conn.execute(
         "INSERT OR IGNORE INTO tombstones(kind, src, dst, rel) VALUES (2, 42, 43, 1)",
         [],
@@ -216,8 +213,7 @@ fn fts_follows_updates_not_just_inserts() {
     );
 }
 
-/// 全量索引結尾的 rebuild 必須可用（DESIGN.md §8.4）。
-/// 這條指令在 external-content 表上是唯一能重建整份索引的方法。
+/// 批次索引結束時用來重建整份 FTS 索引。
 #[test]
 fn fts_rebuild_command_is_available() {
     let conn = fresh_db();
@@ -233,13 +229,12 @@ fn fts_rebuild_command_is_available() {
     );
 }
 
-/// `relations` 與 `tombstones` 宣告成 WITHOUT ROWID，省掉一整份隱含的
-/// rowid 索引。這是體積承諾的一部分（DESIGN.md §8.1）。
+/// `relations` 與 `tombstones` 宣告為 WITHOUT ROWID，省去隱含的 rowid
+/// 索引。
 #[test]
 fn hot_tables_are_without_rowid() {
     let conn = fresh_db();
 
-    // WITHOUT ROWID 的表沒有隱含的 rowid 欄位，SQLite 在 prepare 階段就會拒絕。
     for table in ["relations", "tombstones"] {
         let err = conn
             .query_row(
@@ -254,8 +249,7 @@ fn hot_tables_are_without_rowid() {
         );
     }
 
-    // 對照組：一般表有 rowid，空表只會回「沒有資料列」。
-    // 少了這一半，上面的斷言可能只是因為 SQL 打錯字而通過。
+    // 對照組：一般表有 rowid，空表只會回沒有資料列。
     let err = conn
         .query_row("SELECT rowid FROM symbols LIMIT 1", [], |_| Ok(()))
         .unwrap_err();
@@ -265,8 +259,7 @@ fn hot_tables_are_without_rowid() {
     );
 }
 
-/// 路徑與 moniker 都要唯一——intern 靠這個做 upsert，
-/// 重複的話同一個符號會拿到兩個 id，圖就裂成兩半。
+/// 路徑與 moniker 必須唯一，intern 依此判斷是新增還是重用。
 #[test]
 fn string_pools_reject_duplicates() {
     let conn = fresh_db();
@@ -297,7 +290,7 @@ fn string_pools_reject_duplicates() {
     assert!(dup_handle.is_err(), "handle 碰撞沒有被擋下");
 }
 
-/// schema 落在真的檔案上也要能跑（記憶體 DB 有些行為不同）。
+/// 記憶體資料庫與落地檔案的行為不完全相同，兩者都要驗證。
 #[test]
 fn schema_applies_to_an_on_disk_database() {
     let dir = std::env::temp_dir().join(format!("codegraph-test-{}", std::process::id()));
@@ -312,7 +305,7 @@ fn schema_applies_to_an_on_disk_database() {
         seed(&conn);
     }
 
-    // 重新開啟：資料還在，schema 可以再套一次。
+    // 重新開啟後資料仍在，schema 可再次套用。
     {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(SCHEMA).unwrap();

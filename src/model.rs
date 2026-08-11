@@ -1,27 +1,22 @@
-//! 核心型別。全專案共用，其他模組不得自行定義平行的型別。
-//!
-//! 見 ARCHITECTURE.md §3。
+//! 全專案共用的核心型別。
 
-/// 符號的整數識別碼。等同 `monikers.id`。
+/// 符號的識別碼，對應 `monikers.id`。
 ///
-/// 用 newtype 包 `u32` 而不是裸 `u32`，是為了讓編譯器擋掉
-/// 「把 FileId 傳給吃 SymbolId 的函數」這類錯誤。執行期零成本。
-///
-/// 跨 `base.db` / `pr.db` 必須對齊，見 DESIGN.md §3.2。
+/// 包成 newtype 讓編譯器區分不同的識別碼，執行期無額外成本。
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct SymbolId(pub u32);
 
-/// 檔案的整數識別碼。等同 `files.id`。
+/// 檔案的識別碼，對應 `files.id`。
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct FileId(pub u32);
 
-/// 編譯單元的整數識別碼。等同 `units.id`。
+/// 編譯單元的識別碼，對應 `units.id`。
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct UnitId(pub u32);
 
-/// 符號種類。DB 存 integer，Rust 端有窮盡比對。
+/// 符號種類。
 ///
-/// 數值一旦寫進使用者的 DB 就不能改，只能往後追加。
+/// 判別值會寫進資料庫，只能往後追加，不可修改既有數值。
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum Kind {
@@ -39,9 +34,10 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// 從 DB 讀回來的 integer 還原。未知值回 `None`——
-    /// 代表這份 DB 是更新版本的 schema 寫的，呼叫端要當成錯誤處理，
-    /// 不可以靜默略過。
+    /// 從資料庫的判別值還原。
+    ///
+    /// 未知的值回 `None`，表示這份資料庫由較新的 schema 寫入。
+    /// 呼叫端必須視為錯誤，不可略過。
     pub fn from_u8(v: u8) -> Option<Self> {
         use Kind::*;
         Some(match v {
@@ -60,8 +56,9 @@ impl Kind {
         })
     }
 
-    /// 輸出用的短標籤。也是 moniker 的組成部分之一，
-    /// 因此**改動它會讓所有既有識別碼失效**（見 DESIGN.md §8.3）。
+    /// 輸出用的標籤，同時是 moniker 的組成部分。
+    ///
+    /// 修改這些字串會使所有既有的 moniker 失效。
     pub fn as_str(self) -> &'static str {
         use Kind::*;
         match self {
@@ -80,7 +77,7 @@ impl Kind {
     }
 }
 
-/// 邊的種類。
+/// 邊的種類。判別值的相容性要求同 [`Kind`]。
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
 pub enum Rel {
@@ -93,6 +90,7 @@ pub enum Rel {
 }
 
 impl Rel {
+    /// 從資料庫的判別值還原，未知的值回 `None`。
     pub fn from_u8(v: u8) -> Option<Self> {
         use Rel::*;
         Some(match v {
@@ -106,6 +104,7 @@ impl Rel {
         })
     }
 
+    /// 輸出用的標籤。
     pub fn as_str(self) -> &'static str {
         use Rel::*;
         match self {
@@ -119,10 +118,9 @@ impl Rel {
     }
 }
 
-/// 邊的來源。靜態解析出來的，或啟發式合成的。
+/// 邊的來源：靜態解析或啟發式合成。
 ///
-/// 合成邊必須能被使用者一眼認出來——`explore` 的 Flow 區塊會把
-/// 合成跳點與註冊位置攤開顯示（DESIGN.md §7.3）。
+/// 合成的邊精確度較低，查詢結果必須讓使用者分辨得出來。
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default)]
 #[repr(u8)]
 pub enum Provenance {
@@ -132,6 +130,7 @@ pub enum Provenance {
 }
 
 impl Provenance {
+    /// 從資料庫的判別值還原，未知的值回 `None`。
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Provenance::Static),
@@ -141,68 +140,64 @@ impl Provenance {
     }
 }
 
-/// 一個符號。
-///
-/// `moniker` 只在寫入期需要（用來 intern 成 id），讀取期一律用 `SymbolId`——
-/// 字串在熱路徑上就是 allocation 與比較成本。
+/// 已寫入資料庫的符號。
 #[derive(Clone, Debug)]
 pub struct Symbol {
     pub id: SymbolId,
     pub name: String,
     pub kind: Kind,
     pub file: FileId,
-    /// 1 起算。tree-sitter 的 row 是 0 起算，轉換在 extract 層做。
+    /// 起始行，1 起算。
     pub start_line: u32,
+    /// 結束行，1 起算。
     pub end_line: u32,
     pub signature: Option<String>,
     pub docstring: Option<String>,
 }
 
-/// 一條邊。
+/// 已寫入資料庫的邊。
 #[derive(Clone, Debug)]
 pub struct Relation {
     pub src: SymbolId,
     pub dst: SymbolId,
     pub rel: Rel,
-    /// 呼叫點所在的檔案與行。合成邊可能沒有座標。
+    /// 引用發生的位置。合成的邊沒有位置。
     pub file: Option<FileId>,
     pub line: Option<u32>,
     pub provenance: Provenance,
-    /// 僅 heuristic 邊使用：合成器名稱與註冊位置。
+    /// 合成器名稱與註冊位置，僅 [`Provenance::Heuristic`] 的邊使用。
     pub meta: Option<String>,
 }
 
-/// 抽取階段產生的符號，**還沒有 id**。
+/// 抽取階段產生的符號。
 ///
-/// 抽取層是純函數、不碰 DB，所以它拿不到 `SymbolId`／`FileId`
-/// ——那是 intern 之後才存在的東西（ARCHITECTURE.md §5.1）。
-/// 兩者之間的橋樑是 `moniker`。
+/// 抽取層不存取資料庫，因此還沒有識別碼；與已寫入的符號之間靠
+/// `moniker` 對應。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawSymbol {
-    /// 穩定識別碼。tree-sitter 路徑的組成是
-    /// `{相對路徑}:{kind}:{name}:{起始行}`（DESIGN.md §8.3）。
+    /// 穩定識別碼，格式為 `路徑:kind:name:起始行`。
     pub moniker: String,
-    /// 裸名字，例如 `open`。
+    /// 未限定的名字，例如 `open`。
     pub name: String,
-    /// 帶容器的名字，例如 `Store::open`。查詢與輸出用。
+    /// 含容器的名字，例如 `Store::open`。
     pub qualified: String,
     pub kind: Kind,
-    /// 1 起算。tree-sitter 的 row 是 0 起算，轉換在 extract 層做。
+    /// 起始行，1 起算。
     pub start_line: u32,
+    /// 結束行，1 起算。
     pub end_line: u32,
     pub signature: Option<String>,
     pub docstring: Option<String>,
 }
 
-/// 抽取階段產生、尚未解析成 `Relation` 的引用。
+/// 抽取階段產生、尚未解析成 [`Relation`] 的引用。
 ///
-/// 抽取層不做跨檔推論，只忠實記下「這裡引用了叫這個名字的東西」，
-/// 解析交給 resolve 層（ARCHITECTURE.md §6）。
+/// 抽取層不做跨檔推論，只記錄引用的名字，解析由 resolve 層負責。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawRef {
-    /// 發出這個引用的符號的 moniker。同樣還沒有 id。
+    /// 發出引用的符號的 moniker。
     pub from: String,
-    /// 原文，例如 `"utils.greet"`。
+    /// 引用的原文，例如 `utils.greet`。
     pub name: String,
     pub rel: Rel,
     pub line: u32,
@@ -263,9 +258,6 @@ mod tests {
         assert_eq!(Provenance::Heuristic as u8, 1);
     }
 
-    /// `Kind::as_str` 是 moniker 的組成部分之一，改動它會讓所有既有
-    /// 識別碼失效（DESIGN.md §8.3）。這個測試把字面值釘死，
-    /// 讓「不小心改字串」變成一個測試失敗而不是靜默的索引損壞。
     #[test]
     fn kind_labels_are_pinned() {
         let pairs = [
@@ -284,7 +276,8 @@ mod tests {
         for (k, s) in pairs {
             assert_eq!(k.as_str(), s);
         }
-        // 標籤必須互異，否則兩種 kind 會產生相同的 moniker。
+
+        // 標籤重複會使兩種 kind 產生相同的 moniker。
         let mut labels: Vec<&str> = pairs.iter().map(|(_, s)| *s).collect();
         labels.sort_unstable();
         let before = labels.len();
@@ -305,6 +298,7 @@ mod tests {
         for (r, s) in pairs {
             assert_eq!(r.as_str(), s);
         }
+
         let mut labels: Vec<&str> = pairs.iter().map(|(_, s)| *s).collect();
         labels.sort_unstable();
         let before = labels.len();
@@ -312,9 +306,6 @@ mod tests {
         assert_eq!(before, labels.len(), "rel 標籤有重複");
     }
 
-    /// newtype 的意義就在這裡：SymbolId 與 FileId 不可互換。
-    /// 這個測試主要是文件性質——真正的保障是編譯期，
-    /// `takes_symbol(FileId(1))` 根本編譯不過。
     #[test]
     fn ids_are_distinct_types_with_transparent_values() {
         let s = SymbolId(7);
@@ -353,7 +344,6 @@ mod tests {
         };
         assert_eq!(rel.provenance, Provenance::Static);
 
-        // 合成邊沒有座標，且一定要帶 meta 說明來源（DESIGN.md §7.3）。
         let synth = Relation {
             src: SymbolId(1),
             dst: SymbolId(4),
@@ -383,7 +373,6 @@ mod tests {
             signature: Some("fn caller()".into()),
             docstring: None,
         };
-        // 抽取階段的產物必須靠 moniker 互相指涉，因為此時還沒有任何 id。
         assert_eq!(raw.from, raw_sym.moniker);
     }
 }

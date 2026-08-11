@@ -1,7 +1,6 @@
-//! `codegraph init` —— 建立 `.codegraph/`。
+//! `init` 子命令：建立索引目錄。
 //!
-//! **不會自動開始索引。** 索引是使用者的決定，工具不得自作主張
-//! （ARCHITECTURE.md §12）。
+//! 只準備目錄與空的資料庫，不會開始索引。
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -10,12 +9,13 @@ use crate::error::Result;
 use crate::project::Project;
 use crate::store::Store;
 
+/// 在 `path` 建立索引目錄，未指定時使用工作目錄。
 pub fn run(path: Option<&Path>) -> Result<String> {
     let root = super::resolve_start(path)?;
     let already = Project::is_initialized(&root);
 
     let project = Project::create(&root)?;
-    // 開一次就會建好檔案並套用 schema。重跑時這一步是 no-op。
+    // 開啟一次即可建立資料庫檔案並套用 schema，重複執行不會有副作用。
     let store = Store::open(&project.db_path())?;
 
     let mut out = String::new();
@@ -73,7 +73,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// 重跑 init 不可以清空既有索引——使用者可能只是想確認狀態。
     #[test]
     fn init_never_wipes_an_existing_index() {
         let root = tmpdir("preserve");

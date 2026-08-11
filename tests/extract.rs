@@ -1,14 +1,14 @@
-//! 抽取層的整合測試——**拿本專案自己當索引對象**（自舉）。
+//! 抽取層的整合測試，以本專案自身的原始碼為對象。
 //!
-//! 用真實的、還在長大的原始碼測試，比 fixture 更能抓到「只有在真的
-//! 程式碼裡才會出現」的形狀：巢狀模組、trait 實作、屬性、文件註解。
+//! 真實原始碼涵蓋的語法形狀比人工樣本完整：巢狀模組、trait 實作、
+//! 屬性、文件註解。
 
 use std::path::{Path, PathBuf};
 
 use code_graph::extract;
 use code_graph::model::Kind;
 
-/// 列出 `src/` 底下所有 `.rs` 檔（相對路徑、`/` 分隔）。
+/// 列出 `src/` 底下所有 `.rs` 檔，路徑以斜線分隔。
 fn own_sources() -> Vec<String> {
     let mut out = Vec::new();
     collect(Path::new("src"), &mut out);
@@ -36,8 +36,8 @@ fn parse_file(rel: &str) -> extract::FileParse {
     extract::extract(rel, &source).unwrap()
 }
 
-/// 我們自己的程式碼必須完全解析得動。這裡出現錯誤，代表 tree-sitter
-/// 的文法版本跟不上實際在用的語法。
+/// 本專案的原始碼必須全部解析成功。出現錯誤表示文法版本跟不上實際
+/// 使用的語法。
 #[test]
 fn every_source_file_in_this_project_parses_without_errors() {
     for rel in own_sources() {
@@ -51,8 +51,7 @@ fn every_source_file_in_this_project_parses_without_errors() {
     }
 }
 
-/// 行號必須指向真正的宣告那一行。差一錯誤在這裡最容易發生，
-/// 而且從輸出看不太出來——所以拿原始碼逐行比對。
+/// 行號必須指向宣告本身。與原始碼逐行比對，可以抓出差一錯誤。
 #[test]
 fn every_symbol_points_at_its_own_declaration() {
     for rel in own_sources() {
@@ -92,13 +91,13 @@ fn monikers_are_unique_within_a_file() {
         assert_eq!(
             before,
             seen.len(),
-            "{rel} 有重複的 moniker——兩個符號會在 intern 時撞成同一個 id"
+            "{rel} 有重複的 moniker，兩個符號會 intern 成同一個識別碼"
         );
     }
 }
 
-/// 抽取層是純函數：整棵原始碼樹跑兩次，結果必須逐位元組相同。
-/// 這是「用 content hash 跳過未變更檔案」與快取的前提。
+/// 抽取是純函數，同一棵原始碼樹跑兩次結果必須完全相同。以內容雜湊
+/// 跳過未變更檔案的前提就是這一點。
 #[test]
 fn extracting_the_whole_tree_twice_gives_identical_results() {
     for rel in own_sources() {
@@ -106,8 +105,8 @@ fn extracting_the_whole_tree_twice_gives_identical_results() {
     }
 }
 
-/// 對著自己的 `store` 模組，檢查幾個具體的抽取判斷。
-/// 用「原始碼裡搜得到這一行」而不是寫死行號，才不會每次改檔案就壞。
+/// 檢查 `store` 模組的幾項抽取判斷。以名稱查找而非寫死行號，避免
+/// 檔案變動就失效。
 #[test]
 fn the_store_module_is_extracted_the_way_we_expect() {
     let rel = "src/store/mod.rs";
@@ -135,7 +134,7 @@ fn the_store_module_is_extracted_the_way_we_expect() {
         "Store::open 有文件註解，卻沒有被抽到"
     );
 
-    // `configure` 是模組層的自由函數，不是方法。
+    // configure 是模組層的函數，不是方法。
     let configure = parse
         .symbols
         .iter()
@@ -143,7 +142,7 @@ fn the_store_module_is_extracted_the_way_we_expect() {
         .expect("沒有抽到 configure");
     assert_eq!(configure.kind, Kind::Function);
 
-    // `mod tests` 底下的測試函數是函數，不是方法。
+    // mod tests 底下的測試函數是函數，不是方法。
     let in_tests = parse
         .symbols
         .iter()
@@ -156,7 +155,7 @@ fn the_store_module_is_extracted_the_way_we_expect() {
     );
 }
 
-/// 一份刻意混合各種語法的 fixture。真實原始碼不一定同時出現這些形狀。
+/// 混合多種語法的樣本，補上真實原始碼不一定同時出現的形狀。
 #[test]
 fn a_mixed_fixture_covers_the_shapes_real_code_may_not_have() {
     let src = r#"
@@ -254,7 +253,7 @@ pub const LIMIT: usize = 10;
     );
 }
 
-/// 非 Rust 檔案不歸抽取層管，這不是錯誤。
+/// 非 Rust 檔案不由抽取層處理，這不是錯誤。
 #[test]
 fn non_rust_files_are_skipped_rather_than_failing() {
     for path in ["README.md", "Cargo.toml", "src/store/schema.sql"] {
@@ -265,8 +264,8 @@ fn non_rust_files_are_skipped_rather_than_failing() {
     }
 }
 
-/// 路徑分隔符不同的同一個檔案，必須產出相同的 moniker——
-/// 否則同一份索引在 Windows 與 Linux 上對不起來。
+/// 相同檔案在不同平台的路徑寫法必須產出相同的 moniker，索引才能跨
+/// 平台共用。
 #[test]
 fn windows_and_posix_paths_agree_on_monikers() {
     let src = "fn f() {}\n";
@@ -276,7 +275,7 @@ fn windows_and_posix_paths_agree_on_monikers() {
     assert_eq!(posix.symbols[0].moniker, "src/a/b.rs:function:f:1");
 }
 
-/// 一個空目錄樹不該讓收集器爆掉（`own_sources` 自己的守衛）。
+/// 目錄不存在時收集器應該安靜地回傳空結果。
 #[test]
 fn collecting_from_a_missing_directory_is_harmless() {
     let mut out: Vec<String> = Vec::new();

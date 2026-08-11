@@ -1,20 +1,17 @@
-//! Schema 版本管理。
+//! schema 版本管理。
 //!
-//! 規則：`schema.sql` 永遠是「最新版的完整定義」，migration 只負責把
-//! 舊 DB 帶到最新。新 DB 直接套 `schema.sql`，不重播歷史 migration。
+//! `schema.sql` 保存最新版的完整定義，全新的資料庫直接套用；migration
+//! 只負責把既有的舊資料庫帶到最新版本。
 
 use rusqlite::Connection;
 
 use super::{SCHEMA, SCHEMA_VERSION};
 use crate::error::{CgError, Result};
 
-/// 把連線上的 DB 帶到 `SCHEMA_VERSION`。
+/// 將資料庫升級到 [`SCHEMA_VERSION`]。
 ///
-/// - 空 DB：套用 `schema.sql`，記錄版本。
-/// - 版本相同：什麼都不做。
-/// - 版本較舊：依序跑 migration（目前還沒有）。
-/// - 版本較新：**拒絕開啟**。用舊程式去讀新 schema 會讀到缺欄位的資料，
-///   而 SQLite 不會抱怨——安靜的錯誤比明確的失敗糟得多。
+/// 版本相同時不做任何事。版本較新時回 [`CgError::Corrupt`]：以舊程式
+/// 讀取新 schema 會取到不完整的資料，SQLite 不會回報錯誤。
 pub fn migrate(conn: &Connection) -> Result<()> {
     let found = current_version(conn)?;
 
@@ -30,15 +27,13 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    // found < SCHEMA_VERSION：0 代表全新的 DB。
     conn.execute_batch(SCHEMA)?;
     apply_migrations(conn, found)?;
     record_version(conn, SCHEMA_VERSION)?;
     Ok(())
 }
 
-/// 目前 DB 的 schema 版本。全新的 DB（沒有 `schema_versions` 表，
-/// 或表是空的）一律回 0。
+/// 資料庫目前的 schema 版本。全新的資料庫回 0。
 pub fn current_version(conn: &Connection) -> Result<i64> {
     let has_table: bool = conn.query_row(
         "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='schema_versions'",
@@ -55,20 +50,18 @@ pub fn current_version(conn: &Connection) -> Result<i64> {
     Ok(version.unwrap_or(0))
 }
 
-/// 從 `from` 版本逐級升到最新。
+/// 從 `from` 逐級升到最新版本。
 ///
-/// 目前 `SCHEMA_VERSION == 1`，沒有任何舊版本存在，所以這裡是空的。
-/// 之後每加一版就補一個 arm，並且**不可以**改動已發布的 arm——
-/// 使用者的 DB 會照著跑。
+/// 每新增一版就補一個分支。已發布的分支不可修改，使用者的資料庫會照
+/// 著執行。
 fn apply_migrations(conn: &Connection, from: i64) -> Result<()> {
-    // 目前沒有任何 migration 需要執行 SQL；保留參數是為了讓之後
-    // 新增 arm 時不必改動所有呼叫點。
+    // 目前沒有任何一版需要額外的 SQL。
     let _ = conn;
 
     let mut v = from;
     while v < SCHEMA_VERSION {
         match v {
-            // 0 → 1：`schema.sql` 已經建好全部的表，沒有額外動作。
+            // 0 到 1：schema.sql 已建立全部的表。
             0 => {}
             other => {
                 return Err(CgError::Corrupt {
@@ -131,8 +124,6 @@ mod tests {
         assert_eq!(rows, 1, "重複 migrate 產生了多餘的版本列");
     }
 
-    /// 用舊程式開新 DB 必須明確失敗。安靜地少讀幾個欄位，
-    /// 症狀會是「查詢結果莫名其妙變少」，幾乎不可能追。
     #[test]
     fn a_newer_schema_is_refused() {
         let conn = mem();
@@ -149,7 +140,6 @@ mod tests {
         assert!(err.to_string().contains("升級"));
     }
 
-    /// 版本號有跳號（例如 DB 被手動改過）時，不能默默當成沒事。
     #[test]
     fn an_unknown_upgrade_path_is_reported() {
         let conn = mem();

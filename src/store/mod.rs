@@ -1,8 +1,7 @@
-//! 持久層。**唯一碰 SQL 的地方**。
+//! 索引資料庫的存取層。
 //!
-//! 並行模型見 ARCHITECTURE.md §4.1：寫入只有一個執行緒，
-//! 讀取各自開自己的連線。這個檔案目前只提供可寫連線，
-//! 唯讀連線在需要並行查詢時（Stage 4 之後）再加。
+//! SQL 只出現在這個模組底下。寫入使用單一連線，讀取端各自開啟自己的
+//! 連線。
 
 pub mod migrate;
 
@@ -12,14 +11,13 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 
-/// Schema 全文，編譯期就嵌進 binary——執行期不需要外部檔案，
-/// 這是「單一靜態 binary」承諾的一部分。
+/// schema 全文，於編譯期嵌入，執行期不需要外部檔案。
 pub const SCHEMA: &str = include_str!("schema.sql");
 
-/// 目前的 schema 版本。改動 `schema.sql` 就要加 migration 並升這個數字。
+/// 目前的 schema 版本。修改 `schema.sql` 時必須同步遞增並提供 migration。
 pub const SCHEMA_VERSION: i64 = 1;
 
-/// 每頁 4KB。要在 DB 產生任何頁面**之前**設定，之後再設就沒有效果。
+/// 資料庫頁大小。必須在資料庫產生任何頁面之前設定，之後設定無效。
 const PAGE_SIZE: i64 = 4096;
 
 /// 一個開啟中的索引資料庫。
@@ -28,13 +26,13 @@ pub struct Store {
 }
 
 impl Store {
-    /// 開啟（必要時建立）指定路徑的索引，並升級到最新 schema。
+    /// 開啟指定路徑的索引，必要時建立檔案並套用最新 schema。
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         Self::from_connection(conn)
     }
 
-    /// 記憶體 DB。測試用，也是「不落地的一次性查詢」的基礎。
+    /// 開啟記憶體資料庫。
     pub fn in_memory() -> Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
     }
@@ -45,17 +43,17 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// 底層連線。抽取／解析／查詢層透過它下 SQL——
-    /// 但**只有 `store` 模組底下的程式碼**可以組 SQL 字串。
+    /// 底層連線。
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
 
+    /// 資料庫目前的 schema 版本。
     pub fn schema_version(&self) -> Result<i64> {
         migrate::current_version(&self.conn)
     }
 
-    /// 索引現況。`status` 子命令與 MCP 的 `_meta` 都用它。
+    /// 索引規模摘要。
     pub fn stats(&self) -> Result<Stats> {
         Ok(Stats {
             files: self.count("files")?,
@@ -65,13 +63,14 @@ impl Store {
         })
     }
 
+    /// 計算單一表的列數。`table` 僅接受本模組內的字面值。
     fn count(&self, table: &str) -> Result<i64> {
-        // `table` 只來自這個檔案裡的字面值，不會有外部輸入。
         Ok(self
             .conn
             .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?)
     }
 
+    /// 讀取專案中繼資料，不存在時回 `None`。
     pub fn metadata(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
@@ -83,6 +82,7 @@ impl Store {
         }
     }
 
+    /// 寫入專案中繼資料，同名的鍵會被更新。
     pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO project_metadata(key, value, updated_at) VALUES (?1, ?2, ?3)
@@ -93,7 +93,7 @@ impl Store {
     }
 }
 
-/// 索引的規模摘要。
+/// 索引規模摘要。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Stats {
     pub files: i64,
@@ -103,37 +103,34 @@ pub struct Stats {
 }
 
 impl Stats {
-    /// 還沒索引過任何東西。
+    /// 索引中還沒有任何內容。
     pub fn is_empty(&self) -> bool {
         self.files == 0 && self.symbols == 0
     }
 }
 
-/// 連線層級的設定。**每一條都有理由，不要當成樣板複製走。**
+/// 設定連線層級的 pragma。
 fn configure(conn: &Connection) -> Result<()> {
-    // page_size 必須在建表之前設定，否則對已有頁面的 DB 完全無效。
+    // 必須早於任何建表操作，否則不生效。
     conn.pragma_update(None, "page_size", PAGE_SIZE)?;
 
-    // WAL：讀者不會被寫者擋住。這是「查詢 < 100ms」的前提之一。
-    // journal_mode 這個 pragma 會回傳一列結果，所以用 query_row 而不是 execute。
+    // WAL 讓讀取不被寫入阻擋。此 pragma 會回傳一列結果，故用 query_row。
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
     debug_assert!(
         mode.eq_ignore_ascii_case("wal") || mode.eq_ignore_ascii_case("memory"),
         "沒有進入 WAL 模式，實際是 {mode}"
     );
 
-    // 外鍵預設是**關閉**的。不開的話 ON DELETE CASCADE 完全不生效，
-    // 刪檔案會留下孤兒符號，而且沒有任何錯誤訊息。
+    // 外鍵預設關閉，不開啟則 ON DELETE CASCADE 不會生效且不會報錯。
     conn.pragma_update(None, "foreign_keys", true)?;
 
-    // 崩潰時最多損失最後一次 commit，換來寫入速度。索引是可重建的衍生資料，
-    // 不是使用者資料——這個取捨對這個專案是划算的。
+    // 索引是可重建的衍生資料，以較低的持久性換取寫入速度。
     conn.pragma_update(None, "synchronous", "NORMAL")?;
 
     Ok(())
 }
 
-/// Unix epoch 毫秒。
+/// 目前時間，Unix epoch 毫秒。
 pub(crate) fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -196,7 +193,6 @@ mod tests {
             Some("d923955")
         );
 
-        // 同一個 key 再寫一次是更新，不是新增一列。
         store.set_metadata("base_commit", "abc1234").unwrap();
         assert_eq!(
             store.metadata("base_commit").unwrap().as_deref(),
@@ -209,8 +205,6 @@ mod tests {
         assert_eq!(rows, 1);
     }
 
-    /// 外鍵沒開的話 CASCADE 是死的，而且不會有錯誤——
-    /// 這個測試守住 `configure` 裡那一行。
     #[test]
     fn foreign_keys_are_enforced_on_every_connection() {
         let store = Store::in_memory().unwrap();
@@ -234,7 +228,7 @@ mod tests {
 
     #[test]
     fn now_millis_is_a_plausible_timestamp() {
-        // 2020-01-01 之後、2100 年之前。抓到「時鐘沒設定」這種環境問題。
+        // 2020 年之後、2100 年之前，可抓到時鐘未設定的環境。
         let t = now_millis();
         assert!(t > 1_577_836_800_000);
         assert!(t < 4_102_444_800_000);

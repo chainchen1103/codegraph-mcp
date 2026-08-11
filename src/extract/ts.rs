@@ -1,20 +1,18 @@
-//! tree-sitter 的共用機制：parser 重用、節點文字擷取、註解收集。
+//! tree-sitter 的共用輔助函數。
 
 use std::cell::RefCell;
 
 use tree_sitter::{Language, Node, Parser, Tree};
 
 thread_local! {
-    /// `Parser` 不是 `Sync`，而且建立成本不低。每個執行緒持有自己的一份，
-    /// 在 rayon 的 worker 上重複使用（ARCHITECTURE.md §5.2）。
+    /// `Parser` 不是 `Sync` 且建立成本不低，每個執行緒持有一份重複使用。
     static PARSER: RefCell<Parser> = RefCell::new(Parser::new());
 }
 
-/// 用指定語言解析原始碼。
+/// 以指定語言解析原始碼。
 ///
-/// 回 `None` 代表 tree-sitter 連語法樹都建不出來（語言設定錯誤或
-/// 輸入過大）。**語法錯誤不會走到這裡**——tree-sitter 會盡力恢復並
-/// 回傳一棵含 ERROR 節點的樹，那才是編輯到一半的檔案的常態。
+/// 回 `None` 表示無法建立語法樹，通常是語言設定錯誤。語法錯誤不屬於
+/// 這種情況，tree-sitter 會回傳一棵包含 ERROR 節點的樹。
 pub fn parse(language: &Language, source: &str) -> Option<Tree> {
     PARSER.with(|p| {
         let mut parser = p.borrow_mut();
@@ -25,28 +23,24 @@ pub fn parse(language: &Language, source: &str) -> Option<Tree> {
 
 /// 節點對應的原始碼片段。
 ///
-/// 用 byte range 直接切 `&str` 是安全的：tree-sitter 的節點邊界
-/// 一定落在 UTF-8 字元邊界上。
+/// 節點邊界一定落在 UTF-8 字元邊界上，可直接用位元組範圍切片。
 pub fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
 }
 
-/// tree-sitter 的 row 是 0 起算，我們的行號一律 1 起算。
+/// 節點的起始行，1 起算。
 ///
-/// 這個差一錯誤如果漏掉，會一路污染到輸出，而且從結果看不太出來
-/// ——所以集中在這一個函數，別在各處自己 +1。
+/// tree-sitter 的 row 從 0 起算，轉換集中在這裡。
 pub fn line_of(node: Node<'_>) -> u32 {
     node.start_position().row as u32 + 1
 }
 
+/// 節點的結束行，1 起算。
 pub fn end_line_of(node: Node<'_>) -> u32 {
     node.end_position().row as u32 + 1
 }
 
-/// 把多行、多空白的宣告壓成一行。
-///
-/// 簽名是要給人（和模型）一眼看懂的，原始碼裡的換行與縮排在這裡
-/// 只是噪音。
+/// 將多行宣告壓成單行，連續空白收斂為一個空格。
 pub fn collapse_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_space = false;
@@ -64,14 +58,10 @@ pub fn collapse_whitespace(s: &str) -> String {
     out
 }
 
-/// 收集節點正上方**連續**的文件註解。
+/// 收集節點正上方連續的文件註解。
 ///
-/// - `prefixes`：該語言的文件註解前綴（Rust 是 `///` 與 `//!`）。
-/// - `skip_kinds`：夾在註解與宣告之間、但不打斷這段註解的節點種類。
-///   Rust 的 `#[derive(...)]` 就長在中間，不跳過的話有屬性的型別
-///   全部都會抓不到文件。
-///
-/// 中間隔了空行就停止——那段註解屬於別的東西。
+/// `prefixes` 是該語言的文件註解前綴。`skip_kinds` 列出夾在註解與宣告
+/// 之間但不打斷註解的節點，例如 Rust 的屬性。中間出現空行即停止。
 pub fn leading_line_comments(
     node: Node<'_>,
     source: &str,
@@ -80,12 +70,10 @@ pub fn leading_line_comments(
     skip_kinds: &[&str],
 ) -> Option<String> {
     let mut lines: Vec<String> = Vec::new();
-    // 目前這段註解的下緣。每收一行就往上移。
     let mut below_row = node.start_position().row;
     let mut cursor = node.prev_sibling();
 
     while let Some(prev) = cursor {
-        // 中間空了一整行就不算同一段。
         if below_row.saturating_sub(last_content_row(prev)) > 1 {
             break;
         }
@@ -116,11 +104,10 @@ pub fn leading_line_comments(
     Some(lines.join("\n"))
 }
 
-/// 節點最後一行**有內容**的行號。
+/// 節點最後一行有內容的行號。
 ///
-/// 行註解節點的結束位置常常落在下一行的第 0 欄（它把換行也算進去），
-/// 直接拿 `end_position().row` 判斷相鄰性會把中間的空行吃掉，
-/// 於是上一段不相干的註解會被誤收進來。
+/// 行註解節點的結束位置常落在下一行的第 0 欄，直接使用 `end_position`
+/// 判斷相鄰性會忽略中間的空行。
 fn last_content_row(node: Node<'_>) -> usize {
     let end = node.end_position();
     if end.column == 0 {
@@ -187,7 +174,7 @@ mod tests {
     fn parsing_an_unsupported_input_is_not_a_panic() {
         let lang: Language = tree_sitter_rust::LANGUAGE.into();
         assert!(parse(&lang, "fn a() {}").is_some());
-        // 語法錯誤仍然會建出一棵樹（含 ERROR 節點），不是 None。
+        // 語法錯誤仍會建出一棵含 ERROR 節點的樹。
         assert!(parse(&lang, "fn (((").is_some());
     }
 }

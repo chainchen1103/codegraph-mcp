@@ -1,33 +1,26 @@
-//! 錯誤模型。
+//! 錯誤型別。
 //!
-//! 兩層，界線清楚（ARCHITECTURE.md §8）：
-//!
-//! - lib 內部用 `anyhow` 加 context 往上拋。
-//! - **MCP 邊界是唯一做分類的地方**：可回復的包成「成功 + 引導文字」，
-//!   不可回復的才 `isError`。
-//!
-//! 為什麼這條契約重要：session 早期只要出現一兩次 `isError`，
-//! agent 會整段停用這個工具，後面再也不呼叫，而且不會有任何訊號告訴你。
-//! 見 DESIGN.md §5.3。
+//! 錯誤分成可回復與不可回復兩類。可回復的表示使用者只是還沒做某件事，
+//! 呼叫端應該把訊息當成引導顯示；不可回復的才是真正的失敗。
 
 use std::fmt;
 use std::path::PathBuf;
 
-/// 檔案不在索引內的原因。要能對使用者交代清楚，
-/// 「找不到」跟「被 ignore 掉了」是完全不同的處置。
+/// 檔案不在索引內的原因。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NotIndexedReason {
     /// 被 ignore 規則排除。
     Ignored,
-    /// 副檔名沒有對應的 extractor。
+    /// 副檔名沒有對應的抽取器。
     UnsupportedExtension,
     /// 超過單檔大小上限。
     TooLarge,
-    /// 檔案存在但這次索引之後才建立。
+    /// 檔案存在，但索引建立之後才出現。
     NotYetIndexed,
 }
 
 impl NotIndexedReason {
+    /// 給使用者看的說明。
     pub fn as_str(&self) -> &'static str {
         use NotIndexedReason::*;
         match self {
@@ -39,14 +32,15 @@ impl NotIndexedReason {
     }
 }
 
+/// 本 crate 的錯誤型別。
 #[derive(Debug)]
 pub enum CgError {
-    // ---- 可回復：MCP 層轉成「成功 + 引導文字」 ----
-    /// 這個路徑（含所有上層目錄）沒有 `.codegraph/`。
-    /// 在 monorepo 中只有子專案有索引是常態，這不是錯誤。
+    /// 指定路徑與其上層目錄都沒有索引。
+    ///
+    /// 在 monorepo 中只有部分子專案建立索引是常見情況。
     NotIndexed { path: PathBuf },
 
-    /// 查不到符號。一定要附候選清單，否則呼叫端只能去讀檔。
+    /// 查不到符號。附上最接近的候選，讓呼叫端不必再自行搜尋。
     SymbolNotFound {
         query: String,
         candidates: Vec<String>,
@@ -58,11 +52,10 @@ pub enum CgError {
         reason: NotIndexedReason,
     },
 
-    // ---- 不可回復：MCP 層轉成 isError ----
-    /// 安全拒絕：路徑逃逸出專案根目錄等。
+    /// 路徑超出專案範圍，拒絕存取。
     PathRefused { path: PathBuf },
 
-    /// DB 損毀或 schema 不相容。
+    /// 索引損毀，或 schema 版本不相容。
     Corrupt { detail: String },
 
     /// 底層 I/O 失敗。
@@ -73,10 +66,10 @@ pub enum CgError {
 }
 
 impl CgError {
-    /// 這個錯誤是不是「可回復」的。
+    /// 是否為可回復的狀況。
     ///
-    /// **這是 MCP 回應形狀的唯一判準**，`mcp/shape.rs` 依此決定
-    /// 要包成成功外殼還是 `isError`。契約測試會逐項釘住每個變體。
+    /// 可回復表示操作本身沒有出錯，只是先決條件還沒滿足。介面層依此
+    /// 決定要回傳引導訊息還是錯誤。
     pub fn is_recoverable(&self) -> bool {
         use CgError::*;
         match self {
@@ -101,7 +94,7 @@ impl fmt::Display for CgError {
                 Ok(())
             }
             FileNotIndexed { path, reason } => {
-                write!(f, "{} 不在索引內（{}）", path.display(), reason.as_str())
+                write!(f, "{} 不在索引內：{}", path.display(), reason.as_str())
             }
             PathRefused { path } => write!(f, "拒絕存取專案範圍外的路徑：{}", path.display()),
             Corrupt { detail } => write!(f, "索引損毀：{detail}"),
@@ -140,9 +133,6 @@ pub type Result<T> = std::result::Result<T, CgError>;
 mod tests {
     use super::*;
 
-    /// 這個測試是 DESIGN.md §5.3 契約的第一道防線。
-    /// 新增變體時編譯器會強迫 `is_recoverable` 補上分支，
-    /// 這裡再確認分類沒有被改錯邊。
     #[test]
     fn recoverable_classification_matches_contract() {
         let recoverable = [
@@ -197,8 +187,6 @@ mod tests {
         assert!(!msg.contains("相近的有"), "沒有候選時不該印空清單：{msg}");
     }
 
-    /// 每個變體都要有看得懂的訊息。可回復的那三個會被原文送到 agent 面前
-    /// 當作引導文字（DESIGN.md §5.3），所以不能是 `Debug` 那種格式。
     #[test]
     fn every_variant_renders_a_useful_message() {
         let cases: Vec<(CgError, &str)> = vec![
@@ -256,13 +244,10 @@ mod tests {
         for r in [Ignored, UnsupportedExtension, TooLarge, NotYetIndexed] {
             assert!(!r.as_str().is_empty());
         }
-        // 理由要能比較——重試邏輯會依理由決定要不要再試一次。
         assert_eq!(Ignored, Ignored);
         assert_ne!(Ignored, TooLarge);
     }
 
-    /// 只有包了底層錯誤的變體才有 `source`。這關係到 `anyhow` 印出來的
-    /// 錯誤鏈完不完整——少了 source，使用者只看得到「I/O 失敗」四個字。
     #[test]
     fn only_wrapped_errors_expose_a_source() {
         use std::error::Error;
@@ -277,7 +262,6 @@ mod tests {
         assert!(plain.source().is_none());
     }
 
-    /// `?` 要能把底層錯誤自動轉成 `CgError`，否則每個呼叫點都得手動 map_err。
     #[test]
     fn question_mark_converts_underlying_errors() {
         fn read(path: &str) -> Result<String> {
@@ -297,7 +281,6 @@ mod tests {
         ));
         assert!(matches!(query(true), Err(CgError::Sqlite(_))));
 
-        // 成功路徑也要走一次，確認 `?` 沒有把正常結果一起吃掉。
         assert!(read("Cargo.toml").unwrap().contains("code_graph"));
         assert_eq!(query(false).unwrap(), "ok");
     }

@@ -1,7 +1,6 @@
-//! CodeGraph CLI。
+//! CodeGraph 命令列介面。
 //!
-//! 這一層刻意做薄：只負責解析參數、呼叫 lib、印出結果。
-//! MCP server（Stage 9）會呼叫同一組 lib 函數，兩邊行為才不會分岔。
+//! 只負責解析參數、呼叫 lib 並輸出結果。
 
 use std::path::PathBuf;
 
@@ -12,7 +11,8 @@ use code_graph::cli;
 #[command(
     name = "codegraph",
     version,
-    about = "程式碼結構索引引擎 —— 讓 AI agent 用一次查詢取代讀檔"
+    about = "程式碼結構索引引擎",
+    long_about = None
 )]
 struct Cli {
     #[command(subcommand)]
@@ -21,22 +21,22 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 在指定目錄建立 .codegraph/（不會自動開始索引）
+    /// 建立索引目錄，不會開始索引
     Init {
-        /// 專案根目錄，預設為現在的工作目錄
+        /// 專案根目錄，預設為工作目錄
         path: Option<PathBuf>,
     },
     /// 全量索引整個專案
     Index {
-        /// 專案根目錄，預設從現在的工作目錄往上找 .codegraph/
+        /// 專案根目錄，預設從工作目錄往上尋找
         path: Option<PathBuf>,
     },
-    /// 顯示索引狀態與新鮮度
+    /// 顯示索引狀態
     Status {
-        /// 專案根目錄，預設從現在的工作目錄往上找 .codegraph/
+        /// 專案根目錄，預設從工作目錄往上尋找
         path: Option<PathBuf>,
     },
-    /// 印出單一檔案的結構骨架（不需要索引）
+    /// 印出單一檔案的結構骨架
     Outline {
         /// 要分析的原始碼檔案
         file: PathBuf,
@@ -50,7 +50,7 @@ fn main() -> anyhow::Result<()> {
         Command::Init { path } => cli::init::run(path.as_deref())?,
         Command::Status { path } => cli::status::run(path.as_deref())?,
         Command::Outline { file } => cli::outline::run(&file)?,
-        Command::Index { path } => todo!("Stage 3: cli::index（path = {path:?}）"),
+        Command::Index { path } => todo!("尚未實作：index {path:?}"),
     };
 
     print!("{report}");
