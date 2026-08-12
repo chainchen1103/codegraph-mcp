@@ -86,14 +86,15 @@ impl Writer {
         self.paths.take_pending();
 
         conn.execute(
-            "INSERT OR REPLACE INTO files(id, path, unit_id, is_test, is_generated, content_hash, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+            "INSERT OR REPLACE INTO files(id, path, unit_id, is_test, is_generated, content_hash, module_path, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
             rusqlite::params![
                 file_id,
                 rel_path,
                 unit_id,
                 looks_like_test(rel_path) as i64,
                 content_hash,
+                crate::project::module_path(rel_path),
                 now_millis(),
             ],
         )?;

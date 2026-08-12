@@ -107,6 +107,11 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<()> {
                  DROP TRIGGER IF EXISTS symbols_au;
                  DROP TABLE IF EXISTS symbols_fts;",
             )?,
+            // 2 到 3：檔案記錄自己在模組樹中的位置。既有的列留在預設值，
+            // 下一次全量索引會填上，在那之前只是少一種比對方式。
+            2 => conn.execute_batch(
+                "ALTER TABLE files ADD COLUMN module_path TEXT NOT NULL DEFAULT '';",
+            )?,
             other => {
                 return Err(CgError::Corrupt {
                     detail: format!("沒有從版本 {other} 升級的路徑"),

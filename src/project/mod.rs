@@ -105,6 +105,42 @@ impl Project {
     }
 }
 
+/// 這些目錄各自是一棵原始碼樹的根。
+const SOURCE_ROOTS: [&str; 4] = ["src", "tests", "benches", "examples"];
+
+/// 檔案在模組樹中的位置。
+///
+/// 呼叫寫成 `ts::parse` 時，`ts` 指的是模組而不是型別，而模組對應到
+/// 檔案系統：`src/extract/ts.rs` 就是 `extract::ts`。符號的限定名只
+/// 記錄檔案內部的巢狀結構，這一段資訊得從路徑補回來。
+///
+/// 慣例：`mod.rs`、`lib.rs`、`main.rs` 代表所在目錄本身；`src/` 以外
+/// 的根目錄底下每個檔案自成一個 crate，模組路徑為空。
+pub fn module_path(rel_path: &str) -> String {
+    let normalized = rel_path.replace('\\', "/");
+    let mut segments: Vec<&str> = normalized.split('/').collect();
+
+    let Some(stem) = segments.pop().and_then(|f| f.strip_suffix(".rs")) else {
+        return String::new();
+    };
+
+    let in_src = segments.first() == Some(&"src");
+    if segments.first().is_some_and(|s| SOURCE_ROOTS.contains(s)) {
+        segments.remove(0);
+    }
+
+    // src 以外的根目錄，每個檔案自成一個 crate 的根。
+    if !in_src && segments.is_empty() {
+        return String::new();
+    }
+
+    if !matches!(stem, "mod" | "lib" | "main") {
+        segments.push(stem);
+    }
+
+    segments.join("::")
+}
+
 /// 取得絕對路徑。
 ///
 /// 路徑尚未存在時 `canonicalize` 會失敗，改以工作目錄補齊，讓錯誤訊息
@@ -274,6 +310,53 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_file_maps_to_its_place_in_the_module_tree() {
+        assert_eq!(module_path("src/extract/ts.rs"), "extract::ts");
+        assert_eq!(module_path("src/store/write.rs"), "store::write");
+    }
+
+    /// `mod.rs` 代表所在的目錄，不是目錄底下的一個模組。
+    #[test]
+    fn a_directory_module_takes_the_name_of_its_directory() {
+        assert_eq!(module_path("src/store/mod.rs"), "store");
+        assert_eq!(module_path("src/extract/lang/mod.rs"), "extract::lang");
+    }
+
+    #[test]
+    fn crate_roots_have_an_empty_module_path() {
+        assert_eq!(module_path("src/lib.rs"), "");
+        assert_eq!(module_path("src/main.rs"), "");
+    }
+
+    /// 整合測試每個檔案自成一個 crate。
+    #[test]
+    fn files_outside_src_are_their_own_crate_roots() {
+        assert_eq!(module_path("tests/explore.rs"), "");
+        assert_eq!(module_path("benches/index.rs"), "");
+        assert_eq!(module_path("tests/common/helpers.rs"), "common::helpers");
+    }
+
+    #[test]
+    fn module_paths_do_not_depend_on_the_path_separator() {
+        assert_eq!(
+            module_path(r"src\extract\ts.rs"),
+            module_path("src/extract/ts.rs")
+        );
+    }
+
+    /// 專案根目錄下的單一檔案自成一個 crate，例如建置腳本。
+    #[test]
+    fn a_file_at_the_project_root_is_its_own_crate() {
+        assert_eq!(module_path("build.rs"), "");
+    }
+
+    #[test]
+    fn a_file_that_is_not_rust_has_no_module_path() {
+        assert_eq!(module_path("Cargo.toml"), "");
+        assert_eq!(module_path("README.md"), "");
     }
 
     #[test]

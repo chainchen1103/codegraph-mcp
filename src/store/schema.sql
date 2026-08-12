@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS files (
     is_generated INTEGER NOT NULL DEFAULT 0,
     -- 增量同步依此跳過未變更的檔案。
     content_hash TEXT NOT NULL,
+    -- 檔案在模組樹中的位置，例如 src/extract/ts.rs 是 extract::ts。
+    -- 符號的限定名只記錄檔案內部的巢狀結構，模組層級靠這個欄位補回來。
+    module_path  TEXT NOT NULL DEFAULT '',
     indexed_at   INTEGER NOT NULL
 );
 
@@ -154,6 +157,7 @@ CREATE INDEX IF NOT EXISTS idx_symbols_file   ON symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_name   ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified);
 CREATE INDEX IF NOT EXISTS idx_files_unit     ON files(unit_id);
+CREATE INDEX IF NOT EXISTS idx_files_module   ON files(module_path);
 -- 部分索引：只有待重試的列會被掃到。
 CREATE INDEX IF NOT EXISTS idx_unresolved_tail
     ON unresolved_refs(name_tail) WHERE status = 1;

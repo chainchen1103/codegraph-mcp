@@ -28,31 +28,63 @@ pub fn tail(name: &str) -> &str {
 
 /// 把引用對應到符號。
 ///
-/// 步驟由可靠到勉強：
+/// 兩條路徑，看原始碼有沒有寫出容器。
 ///
-/// 1. 由長到短嘗試限定名。呼叫寫成什麼樣子取決於檔案頂端 import 了哪
-///    一層，`crate::store::Store::open` 與 `Store::open` 指的是同一個
-///    東西，逐段去掉前綴就能對上，不必另外維護 import 表。
-/// 2. 原始碼裡寫了容器卻對不到任何符號，表示那個容器不屬於這個專案，
-///    例如 `Vec::new`。直接判為外部，不再往下猜。
-/// 3. 只有名字的引用退到比對最後一段。接收者的型別查不到時，這一步
-///    只在同一個檔案裡進行。
+/// **沒寫容器**（`helper()`、型別不明的 `x.method()`）直接比對名字，
+/// 同一個檔案優先。
+///
+/// **寫了容器**依序嘗試：
+///
+/// 1. 原文照著找。
+/// 2. 容器全是模組名時，用檔案在模組樹中的位置比對。符號的限定名只記
+///    錄檔案內部的巢狀結構，`ts::parse` 前面那一段指的是檔案位置。
+/// 3. 逐段剝掉模組前綴再找。呼叫寫成什麼樣子取決於檔案頂端 import 了
+///    哪一層，`crate::store::Store::open` 與 `Store::open` 是同一個東
+///    西，剝掉前綴就能對上，不必另外維護 import 表。
+/// 4. 全部落空表示那個容器不屬於這個專案，例如 `Vec::new`。判為外部，
+///    不再退回去比對名字。
 pub fn resolve(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> Result<Match> {
     let style = Style::of(ref_name);
 
-    for suffix in suffixes(ref_name) {
-        match lookup(conn, Field::Qualified, &suffix, from_file, rel, style)? {
+    // 沒有寫容器：直接比對名字，同一個檔案優先。
+    //
+    // 不能先把它當限定名做全域比對：`parse` 在好幾個檔案裡都有，一比
+    // 就是有歧義，反而蓋掉「呼叫端自己的檔案裡就有一個」這個更強的
+    // 訊號。
+    if !ref_name.contains("::") {
+        return lookup(conn, Field::Name, tail(ref_name), from_file, rel, style);
+    }
+
+    let forms = suffixes(ref_name);
+
+    // 原始碼裡怎麼寫的，先照著找。
+    if let Some(written) = forms.first() {
+        match lookup(conn, Field::Qualified, written, from_file, rel, style)? {
+            Match::None => {}
+            found => return Ok(found),
+        }
+    }
+
+    // 容器全是模組名時，改用檔案在模組樹中的位置比對。
+    //
+    // 這一步要排在縮短寫法之前：模組路徑用得到檔案的位置，比單純把
+    // 前綴丟掉更具體。`query::parse` 縮成 `parse` 會撞上其他檔案裡的
+    // 同名函數而變成有歧義，模組路徑卻能指出是哪一個。
+    match by_module(conn, ref_name, rel, style)? {
+        Match::None => {}
+        found => return Ok(found),
+    }
+
+    // 再退到逐段縮短的寫法。
+    for suffix in forms.iter().skip(1) {
+        match lookup(conn, Field::Qualified, suffix, from_file, rel, style)? {
             Match::None => continue,
             found => return Ok(found),
         }
     }
 
-    // 作者已經指明容器，而那個容器不在索引裡。
-    if ref_name.contains("::") {
-        return Ok(Match::None);
-    }
-
-    lookup(conn, Field::Name, tail(ref_name), from_file, rel, style)
+    // 作者已經指明容器，而那個容器不在索引裡，那就是外部的東西。
+    Ok(Match::None)
 }
 
 /// 由長到短的後綴，只剝掉模組路徑。
@@ -71,6 +103,11 @@ fn suffixes(name: &str) -> Vec<String> {
         if !is_module_like(segments[i]) {
             break;
         }
+        // 剝到只剩名字就不再產生：那種形狀交給模組路徑比對，它用得到
+        // 檔案的位置，比拿裸名去比對全專案的限定名可靠。
+        if segments.len() - i - 1 < 2 {
+            break;
+        }
         out.push(segments[i + 1..].join("::"));
     }
 
@@ -80,6 +117,32 @@ fn suffixes(name: &str) -> Vec<String> {
 /// 這一段看起來是模組而不是型別。
 fn is_module_like(segment: &str) -> bool {
     segment.chars().next().is_some_and(|c| !c.is_uppercase())
+}
+
+/// 用檔案在模組樹中的位置比對。
+///
+/// 符號的限定名只記錄檔案內部的巢狀結構，`src/extract/ts.rs` 裡的
+/// `parse` 限定名就是 `parse`。呼叫端寫 `ts::parse`，前面那一段指的是
+/// 檔案的位置，不是檔案裡的容器，逐段縮短永遠對不上。
+///
+/// 只在容器全是模組名時嘗試。含大寫段的是型別，型別不對應到檔案。
+fn by_module(conn: &Connection, ref_name: &str, rel: Rel, style: Style) -> Result<Match> {
+    let Some((container, name)) = ref_name.rsplit_once("::") else {
+        return Ok(Match::None);
+    };
+    if container.is_empty() || !container.split("::").all(is_module_like) {
+        return Ok(Match::None);
+    }
+
+    let sql = format!(
+        "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+         WHERE s.qualified = ?1
+           AND (f.module_path = ?2 OR f.module_path LIKE '%::' || ?2){}
+         LIMIT 2",
+        kind_filter(rel, Field::Qualified, style)
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    first_or_ambiguous(&mut stmt, rusqlite::params![name, container])
 }
 
 /// 呼叫的寫法。
@@ -348,11 +411,8 @@ mod tests {
             ]
         );
 
-        // 模組底下的自由函數：剝到只剩函數名是對的。
-        assert_eq!(
-            suffixes("walk::source_files"),
-            vec!["walk::source_files", "source_files"]
-        );
+        // 剝到只剩名字就停：那種形狀由模組路徑比對負責。
+        assert_eq!(suffixes("walk::source_files"), vec!["walk::source_files"]);
 
         // 型別不剝。
         assert_eq!(suffixes("Vec::push"), vec!["Vec::push"]);
@@ -374,6 +434,61 @@ mod tests {
     fn an_external_container_never_falls_through_to_a_bare_function() {
         let s = store_with(&[("push", "push", Kind::Function, 1)]);
         assert_eq!(call(&s, "Vec::push", 1), Match::None);
+    }
+
+    /// 模組限定的呼叫靠檔案在模組樹中的位置指認。
+    #[test]
+    fn a_module_qualified_call_is_matched_by_the_files_module_path() {
+        let s = store_with(&[("parse", "parse", Kind::Function, 1)]);
+        s.conn()
+            .execute(
+                "UPDATE files SET module_path = 'extract::ts' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(call(&s, "ts::parse", 2), certain(1));
+        assert_eq!(call(&s, "extract::ts::parse", 2), certain(1));
+    }
+
+    /// 模組路徑對不上就不算，不能只憑函數同名就接上去。
+    #[test]
+    fn a_module_that_does_not_match_the_file_is_not_accepted() {
+        let s = store_with(&[("parse", "parse", Kind::Function, 1)]);
+        s.conn()
+            .execute("UPDATE files SET module_path = 'store' WHERE id = 1", [])
+            .unwrap();
+
+        assert_eq!(call(&s, "ts::parse", 2), Match::None);
+    }
+
+    /// 模組路徑比對排在縮短寫法之前。縮短後的裸名在多個檔案裡都有，
+    /// 先縮短就會變成有歧義，模組路徑卻指得出是哪一個。
+    #[test]
+    fn the_module_path_wins_over_shortening_the_reference() {
+        let s = store_with(&[
+            ("parse", "parse", Kind::Function, 1),
+            ("parse", "parse", Kind::Function, 2),
+        ]);
+        s.conn()
+            .execute_batch(
+                "UPDATE files SET module_path = 'explore::query' WHERE id = 1;
+                 UPDATE files SET module_path = 'extract::ts' WHERE id = 2;",
+            )
+            .unwrap();
+
+        assert_eq!(call(&s, "query::parse", 2), certain(1));
+        assert_eq!(call(&s, "ts::parse", 1), certain(2));
+    }
+
+    /// 只寫名字的呼叫先看自己的檔案，不先當成限定名做全域比對。
+    #[test]
+    fn a_bare_name_prefers_the_callers_own_file() {
+        let s = store_with(&[
+            ("parse", "tests::parse", Kind::Function, 1),
+            ("parse", "parse", Kind::Function, 2),
+        ]);
+        assert_eq!(call(&s, "parse", 1), certain(1));
     }
 
     #[test]
