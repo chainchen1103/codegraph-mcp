@@ -230,12 +230,14 @@ mod tests {
     }
 
     /// 兩個同名的方法無從分辨時不猜，把引用留在待解析狀態。
+    ///
+    /// 接收者刻意沒有型別可查：有型別標註的話抽取階段就會把它解析掉。
     #[test]
     fn an_ambiguous_call_is_kept_instead_of_guessed() {
         let mut store = indexed(&[(
             "src/a.rs",
             "struct A;\nimpl A {\n    fn run(&self) {}\n}\nstruct B;\nimpl B {\n    fn run(&self) {}\n}\n\
-             fn caller(x: A) {\n    x.run();\n}\n",
+             fn caller() {\n    let x = make();\n    x.run();\n}\n",
         )]);
 
         let report = resolve_all(&mut store).unwrap();

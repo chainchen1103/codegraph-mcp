@@ -11,6 +11,14 @@ use crate::store::Store;
 /// 最多列出幾則警告，其餘以總數帶過。
 const MAX_WARNINGS_SHOWN: usize = 10;
 
+/// 佔比，分母為零時回 0。
+fn percent(part: usize, whole: usize) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    part as f64 / whole as f64 * 100.0
+}
+
 /// 索引 `path` 所屬的專案，未指定時使用工作目錄。
 pub fn run(path: Option<&Path>) -> Result<String> {
     let start = super::resolve_start(path)?;
@@ -27,6 +35,28 @@ pub fn run(path: Option<&Path>) -> Result<String> {
     if report.skipped_symbols > 0 {
         writeln!(out, "略過      {}", report.skipped_symbols).ok();
     }
+    writeln!(out).ok();
+
+    let resolve = &report.resolve;
+    writeln!(out, "關係      {}", resolve.resolved).ok();
+    if resolve.guessed > 0 {
+        writeln!(
+            out,
+            "  其中推測  {}（{:.0}%）",
+            resolve.guessed,
+            percent(resolve.guessed, resolve.resolved)
+        )
+        .ok();
+    }
+    writeln!(
+        out,
+        "待解析    {}（{:.1}%）",
+        resolve.ambiguous,
+        resolve.pending_ratio() * 100.0
+    )
+    .ok();
+    writeln!(out, "外部呼叫  {}", resolve.external).ok();
+    writeln!(out).ok();
     writeln!(out, "耗時      {} ms", report.elapsed.as_millis()).ok();
 
     if !report.warnings.is_empty() {

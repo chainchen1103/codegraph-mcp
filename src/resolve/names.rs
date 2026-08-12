@@ -35,7 +35,8 @@ pub fn tail(name: &str) -> &str {
 ///    東西，逐段去掉前綴就能對上，不必另外維護 import 表。
 /// 2. 原始碼裡寫了容器卻對不到任何符號，表示那個容器不屬於這個專案，
 ///    例如 `Vec::new`。直接判為外部，不再往下猜。
-/// 3. 只有名字的引用才退到比對最後一段，並優先考慮同一個檔案。
+/// 3. 只有名字的引用退到比對最後一段。接收者的型別查不到時，這一步
+///    只在同一個檔案裡進行。
 pub fn resolve(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> Result<Match> {
     let style = Style::of(ref_name);
 
@@ -54,12 +55,31 @@ pub fn resolve(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> R
     lookup(conn, Field::Name, tail(ref_name), from_file, rel, style)
 }
 
-/// `a::b::c` 的所有後綴，由長到短。
+/// 由長到短的後綴，只剝掉模組路徑。
+///
+/// 要剝的是 import 層級的差異：`crate::store::Store::open` 與
+/// `Store::open` 是同一個東西。但剝到型別就得停 —— `Vec::push` 再剝一
+/// 段會變成 `push`，然後落在專案裡剛好叫 `push` 的自由函數上。
+///
+/// 用命名慣例區分：模組是小寫，型別是大寫開頭。這是 Rust 一致遵守的
+/// 慣例，而位置本身分不出這兩者。
 fn suffixes(name: &str) -> Vec<String> {
     let segments: Vec<&str> = name.split("::").collect();
-    (0..segments.len())
-        .map(|i| segments[i..].join("::"))
-        .collect()
+    let mut out = vec![name.to_string()];
+
+    for i in 0..segments.len().saturating_sub(1) {
+        if !is_module_like(segments[i]) {
+            break;
+        }
+        out.push(segments[i + 1..].join("::"));
+    }
+
+    out
+}
+
+/// 這一段看起來是模組而不是型別。
+fn is_module_like(segment: &str) -> bool {
+    segment.chars().next().is_some_and(|c| !c.is_uppercase())
 }
 
 /// 呼叫的寫法。
@@ -83,17 +103,6 @@ impl Style {
             Style::Direct
         }
     }
-
-    /// 只憑名字對到的方法有多可信。
-    ///
-    /// 接收者的型別未知，同名的方法很可能屬於標準函式庫而不是這個
-    /// 專案。邊仍然建立，但標記成推測，讓輸出能夠區分。
-    fn confidence(self, field: Field, scope: Scope) -> Provenance {
-        match (self, field, scope) {
-            (Style::Receiver, Field::Name, Scope::Anywhere) => Provenance::Heuristic,
-            _ => Provenance::Static,
-        }
-    }
 }
 
 /// 任何呼叫都不可能落在的種類。
@@ -113,13 +122,6 @@ const RECEIVER_EXCLUDES: [Kind; 6] = [
     Kind::Struct,
     Kind::Enum,
 ];
-
-/// 比對的範圍。
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Scope {
-    SameFile,
-    Anywhere,
-}
 
 /// 比對的欄位。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -156,7 +158,7 @@ fn lookup(
 ) -> Result<Match> {
     match unique_in_file(conn, field, value, from_file, rel, style)? {
         Match::None => {}
-        found => return Ok(stamp(found, style, field, Scope::SameFile)),
+        found => return Ok(found),
     }
 
     // 只有帶容器的寫法才做結尾比對。單獨一個名字去比對任何容器的結尾，
@@ -164,20 +166,22 @@ fn lookup(
     if field == Field::Qualified && value.contains("::") {
         match suffix_in_file(conn, value, from_file, rel, style)? {
             Match::None => {}
-            found => return Ok(stamp(found, style, field, Scope::SameFile)),
+            found => return Ok(found),
         }
     }
 
-    let found = unique_anywhere(conn, field, value, rel, style)?;
-    Ok(stamp(found, style, field, Scope::Anywhere))
-}
-
-/// 給比對結果標上可信度。
-fn stamp(found: Match, style: Style, field: Field, scope: Scope) -> Match {
-    match found {
-        Match::One(id, _) => Match::One(id, style.confidence(field, scope)),
-        other => other,
+    // 接收者的型別查不到，就不拿方法名去比對整個專案。
+    //
+    // 抽取階段查得到型別的呼叫已經寫成 `Type::method`，還帶著句點就
+    // 表示查不到。此時「全專案剛好只有一個同名方法」不是證據：
+    // `r.get(0)` 的 `r` 是外部函式庫的型別，專案裡碰巧也有 `get`，
+    // 接上去就是一條錯的邊。同檔案裡有同名方法仍然算數，那是弱但
+    // 真實的上下文。
+    if field == Field::Name && style == Style::Receiver {
+        return Ok(Match::None);
     }
+
+    unique_anywhere(conn, field, value, rel, style)
 }
 
 /// 同一個檔案裡，限定名以 `value` 結尾的符號。
@@ -334,17 +338,42 @@ mod tests {
     }
 
     #[test]
-    fn suffixes_go_from_longest_to_shortest() {
+    fn module_prefixes_are_stripped_but_types_are_kept() {
         assert_eq!(
             suffixes("crate::store::Store::open"),
             vec![
                 "crate::store::Store::open",
                 "store::Store::open",
-                "Store::open",
-                "open"
+                "Store::open"
             ]
         );
+
+        // 模組底下的自由函數：剝到只剩函數名是對的。
+        assert_eq!(
+            suffixes("walk::source_files"),
+            vec!["walk::source_files", "source_files"]
+        );
+
+        // 型別不剝。
+        assert_eq!(suffixes("Vec::push"), vec!["Vec::push"]);
+        assert_eq!(suffixes("Store::open"), vec!["Store::open"]);
         assert_eq!(suffixes("open"), vec!["open"]);
+    }
+
+    #[test]
+    fn the_module_convention_is_by_first_letter() {
+        assert!(is_module_like("store"));
+        assert!(is_module_like("_private"));
+        assert!(!is_module_like("Store"));
+        assert!(!is_module_like(""));
+    }
+
+    /// 容器不在索引裡的呼叫不能退到裸名比對，否則 `Vec::push` 會落在
+    /// 專案裡剛好叫 `push` 的自由函數上。
+    #[test]
+    fn an_external_container_never_falls_through_to_a_bare_function() {
+        let s = store_with(&[("push", "push", Kind::Function, 1)]);
+        assert_eq!(call(&s, "Vec::push", 1), Match::None);
     }
 
     #[test]
@@ -469,14 +498,14 @@ mod tests {
         assert_eq!(call(&s, "stats", 1), Match::None);
     }
 
-    /// 接收者的型別未知，只憑方法名跨檔案對上的邊標成推測。
+    /// 接收者的型別查不到時，不拿方法名去比對整個專案。
+    ///
+    /// 「全專案剛好只有一個同名方法」不構成證據：`r.get(0)` 的 `r` 是
+    /// 外部函式庫的型別，接到專案裡碰巧同名的 `get` 上就是一條錯的邊。
     #[test]
-    fn a_method_matched_only_by_name_is_marked_as_a_guess() {
+    fn an_unknown_receiver_does_not_reach_across_files() {
         let s = store_with(&[("stats", "Store::stats", Kind::Method, 1)]);
-        assert_eq!(
-            call(&s, "store.stats", 2),
-            Match::One(SymbolId(1), Provenance::Heuristic)
-        );
+        assert_eq!(call(&s, "store.stats", 2), Match::None);
     }
 
     /// 同一個檔案裡的方法有上下文支撐，不算推測。

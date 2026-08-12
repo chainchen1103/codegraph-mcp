@@ -8,6 +8,7 @@ use tree_sitter::{Language, Node};
 
 use super::super::ts;
 use super::super::{Extractor, FileParse};
+use super::bindings::Bindings;
 use crate::extract::moniker;
 use crate::model::{Kind, RawRef, RawSymbol, Rel};
 
@@ -76,6 +77,15 @@ impl Scope {
             format!("{}::{}", self.container.join("::"), name)
         }
     }
+
+    /// `self` 在這個位置指的是哪個型別。
+    fn self_type(&self) -> Option<&str> {
+        if self.in_type {
+            self.container.last().map(String::as_str)
+        } else {
+            None
+        }
+    }
 }
 
 /// 走訪一層節點，把找到的宣告收進 `out`。
@@ -118,7 +128,9 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
                 };
                 let moniker = push(child, source, path, scope, kind, name, out);
                 if let Some(body) = child.child_by_field_name("body") {
-                    collect_calls(body, source, &moniker, out);
+                    let mut bindings = Bindings::new();
+                    bind_parameters(child, source, scope, &mut bindings);
+                    collect_calls(body, source, &moniker, &mut bindings, out);
                 }
             }
             "struct_item" => leaf(child, source, path, scope, Kind::Struct, out),
@@ -146,11 +158,21 @@ fn leaf(node: Node<'_>, source: &str, path: &str, scope: &Scope, kind: Kind, out
 
 /// 走遍節點底下所有的呼叫，記到 `from` 名下。
 ///
-/// 只記下被呼叫者在原始碼裡寫成什麼樣子，不做任何解析。巢狀函數與
-/// 閉包裡的呼叫都算在外層函數頭上，它們是同一段邏輯的一部分。
-fn collect_calls(node: Node<'_>, source: &str, from: &str, out: &mut FileParse) {
+/// 一邊走一邊維護區塊與變數綁定：接收者的型別在這裡查得到的話，呼叫
+/// 就直接記成 `Type::method`，解析階段走限定名比對並驗證該型別確實有
+/// 這個方法。查不到就保留原文，交給解析階段判斷。
+///
+/// 巢狀函數與閉包裡的呼叫都算在外層函數頭上，它們是同一段邏輯的一
+/// 部分。
+fn collect_calls(
+    node: Node<'_>,
+    source: &str,
+    from: &str,
+    bindings: &mut Bindings,
+    out: &mut FileParse,
+) {
     if node.kind() == "call_expression"
-        && let Some(name) = callee_name(node, source)
+        && let Some(name) = callee_name(node, source, bindings)
     {
         out.refs.push(RawRef {
             from: from.to_string(),
@@ -160,40 +182,158 @@ fn collect_calls(node: Node<'_>, source: &str, from: &str, out: &mut FileParse) 
         });
     }
 
+    let opens_block = matches!(node.kind(), "block" | "closure_expression");
+    if opens_block {
+        bindings.enter();
+        if node.kind() == "closure_expression" {
+            bind_closure_parameters(node, source, bindings);
+        }
+    }
+
     // 依原始碼順序遞迴，輸出才與檔案內容一致。
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_calls(child, source, from, out);
+        collect_calls(child, source, from, bindings, out);
+    }
+
+    // 綁定在初始化運算式走完之後才生效：`let x = x.wrap();` 右邊的 `x`
+    // 指的是舊的那一個。
+    if node.kind() == "let_declaration" {
+        bind_let(node, source, bindings);
+    }
+
+    if opens_block {
+        bindings.leave();
+    }
+}
+
+/// 記下函數參數與 `self` 的型別。
+fn bind_parameters(function: Node<'_>, source: &str, scope: &Scope, bindings: &mut Bindings) {
+    if let Some(self_type) = scope.self_type() {
+        bindings.insert("self", self_type);
+    }
+
+    let Some(parameters) = function.child_by_field_name("parameters") else {
+        return;
+    };
+
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        bind_typed_pattern(parameter, source, bindings);
+    }
+}
+
+/// 閉包參數只有帶型別標註時才記得下來。
+fn bind_closure_parameters(closure: Node<'_>, source: &str, bindings: &mut Bindings) {
+    let Some(parameters) = closure.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        bind_typed_pattern(parameter, source, bindings);
+    }
+}
+
+/// `name: Type` 這種形狀的宣告。
+fn bind_typed_pattern(node: Node<'_>, source: &str, bindings: &mut Bindings) {
+    let (Some(pattern), Some(type_node)) = (
+        node.child_by_field_name("pattern"),
+        node.child_by_field_name("type"),
+    ) else {
+        return;
+    };
+    if pattern.kind() != "identifier" {
+        return;
+    }
+    bindings.insert(
+        ts::text(pattern, source),
+        &type_base_name(type_node, source),
+    );
+}
+
+/// `let` 綁定的型別，來自標註或初始化運算式。
+fn bind_let(node: Node<'_>, source: &str, bindings: &mut Bindings) {
+    let Some(pattern) = node.child_by_field_name("pattern") else {
+        return;
+    };
+    if pattern.kind() != "identifier" {
+        return;
+    }
+    let name = ts::text(pattern, source);
+
+    if let Some(type_node) = node.child_by_field_name("type") {
+        bindings.insert(name, &type_base_name(type_node, source));
+        return;
+    }
+
+    if let Some(value) = node.child_by_field_name("value")
+        && let Some(inferred) = initializer_type(value, source)
+    {
+        bindings.insert(name, &inferred);
+    }
+}
+
+/// 從初始化運算式看得出來的型別。
+///
+/// 只認結構明確的幾種寫法。看不出來就不記，讓解析階段知道這裡沒有
+/// 型別資訊，而不是給它一個猜的。
+fn initializer_type(value: Node<'_>, source: &str) -> Option<String> {
+    match value.kind() {
+        // Foo { .. }
+        "struct_expression" => value
+            .child_by_field_name("name")
+            .map(|n| type_base_name(n, source)),
+        // Foo::new(..)
+        "call_expression" => {
+            let function = value.child_by_field_name("function")?;
+            if function.kind() != "scoped_identifier" {
+                return None;
+            }
+            let container = function.child_by_field_name("path")?;
+            let name = type_base_name(container, source);
+            // 只有大寫開頭才是型別，`store::open()` 的 `store` 是模組。
+            name.starts_with(char::is_uppercase).then_some(name)
+        }
+        // &expr / &mut expr
+        "reference_expression" => value
+            .child_by_field_name("value")
+            .and_then(|inner| initializer_type(inner, source)),
+        _ => None,
     }
 }
 
 /// 被呼叫者在原始碼裡的寫法。
 ///
-/// 保留原文，例如 `Store::open` 或 `store.stats`。解析階段依賴這兩點：
-/// 路徑越完整越容易對到唯一的符號；而寫法裡有沒有句點，決定了這是
-/// 對接收者呼叫方法，還是直接呼叫一個函數。
-fn callee_name(call: Node<'_>, source: &str) -> Option<String> {
+/// 接收者的型別查得到時改寫成 `Type::method`，這樣解析階段就能用限定
+/// 名比對並驗證。查不到則保留原文，寫法裡的句點會讓解析階段知道這是
+/// 對某個值呼叫方法。
+fn callee_name(call: Node<'_>, source: &str, bindings: &Bindings) -> Option<String> {
     let function = call.child_by_field_name("function")?;
-    callee_name_of(function, source)
+    callee_name_of(function, source, bindings)
 }
 
-fn callee_name_of(function: Node<'_>, source: &str) -> Option<String> {
+fn callee_name_of(function: Node<'_>, source: &str, bindings: &Bindings) -> Option<String> {
     match function.kind() {
         // foo() 與 a::b::c()
         "identifier" | "scoped_identifier" => Some(ts::text(function, source).to_string()),
-        // x.method()：連同接收者一起記下來。
+        // x.method()
         "field_expression" => {
             let field = function.child_by_field_name("field")?;
-            let receiver = function
-                .child_by_field_name("value")
-                .map(|v| ts::collapse_whitespace(ts::text(v, source)))
-                .unwrap_or_default();
-            Some(format!("{receiver}.{}", ts::text(field, source)))
+            let method = ts::text(field, source);
+            let value = function.child_by_field_name("value")?;
+            let receiver = ts::collapse_whitespace(ts::text(value, source));
+
+            if matches!(value.kind(), "identifier" | "self")
+                && let Some(type_name) = bindings.get(&receiver)
+            {
+                return Some(format!("{type_name}::{method}"));
+            }
+            Some(format!("{receiver}.{method}"))
         }
         // foo::<T>()
         "generic_function" => function
             .child_by_field_name("function")
-            .and_then(|inner| callee_name_of(inner, source)),
+            .and_then(|inner| callee_name_of(inner, source, bindings)),
         _ => None,
     }
 }
@@ -514,12 +654,88 @@ mod tests {
         assert_eq!(refs_of(&p, "caller"), vec!["Store::open", "a::b::c"]);
     }
 
-    /// 方法呼叫連同接收者一起記下。句點的存在讓解析階段知道這是對某個
-    /// 值呼叫方法，而不是直接呼叫函數。
+    /// 接收者的型別查不到時保留原文。句點的存在讓解析階段知道這是對
+    /// 某個值呼叫方法，而不是直接呼叫函數。
     #[test]
-    fn method_calls_record_the_receiver_too() {
-        let p = parse("fn caller(s: Store) {\n    s.open();\n    self.close();\n}\n");
-        assert_eq!(refs_of(&p, "caller"), vec!["s.open", "self.close"]);
+    fn a_method_call_on_an_unknown_receiver_keeps_the_written_form() {
+        let p = parse("fn caller() {\n    let s = make();\n    s.open();\n}\n");
+        assert_eq!(refs_of(&p, "caller"), vec!["make", "s.open"]);
+    }
+
+    /// 參數有型別標註，方法呼叫直接記成限定名。
+    #[test]
+    fn a_typed_parameter_turns_a_method_call_into_a_qualified_name() {
+        let p = parse("fn caller(s: Store) {\n    s.open();\n}\n");
+        assert_eq!(refs_of(&p, "caller"), vec!["Store::open"]);
+    }
+
+    /// `self` 就是所屬的型別，不需要推測。
+    #[test]
+    fn self_resolves_to_the_enclosing_type() {
+        let p = parse(
+            "struct S;\nimpl S {\n    fn a(&self) {\n        self.b();\n    }\n    fn b(&self) {}\n}\n",
+        );
+        assert_eq!(refs_of(&p, "S::a"), vec!["S::b"]);
+    }
+
+    /// 自由函數裡的 `self` 沒有型別可言。
+    #[test]
+    fn self_outside_a_type_has_no_binding() {
+        let p = parse("fn caller() {\n    self.close();\n}\n");
+        assert_eq!(refs_of(&p, "caller"), vec!["self.close"]);
+    }
+
+    #[test]
+    fn a_let_binding_with_an_annotation_is_tracked() {
+        let p = parse("fn caller() {\n    let s: Store = build();\n    s.open();\n}\n");
+        assert!(refs_of(&p, "caller").contains(&"Store::open".to_string()));
+    }
+
+    #[test]
+    fn a_let_binding_initialised_by_a_constructor_is_tracked() {
+        let p = parse(
+            "fn caller() {\n    let s = Store::new();\n    let w = Writer { inner: 1 };\n\
+             s.open();\n    w.flush();\n}\n",
+        );
+        let refs = refs_of(&p, "caller");
+        assert!(refs.contains(&"Store::open".to_string()), "{refs:?}");
+        assert!(refs.contains(&"Writer::flush".to_string()), "{refs:?}");
+    }
+
+    /// 模組路徑不是型別，`store::open()` 的 `store` 不能拿來當接收者型別。
+    #[test]
+    fn a_module_path_initialiser_is_not_treated_as_a_type() {
+        let p = parse("fn caller() {\n    let s = store::open();\n    s.flush();\n}\n");
+        assert!(refs_of(&p, "caller").contains(&"s.flush".to_string()));
+    }
+
+    /// 內層區塊的綁定遮蔽外層，離開區塊之後外層的綁定回來。
+    #[test]
+    fn an_inner_binding_shadows_the_outer_one() {
+        let p = parse(
+            "fn caller(s: Store) {\n    {\n        let s: Writer = build();\n        s.run();\n    }\n\
+             s.run();\n}\n",
+        );
+        let refs = refs_of(&p, "caller");
+        assert!(refs.contains(&"Writer::run".to_string()), "{refs:?}");
+        assert!(refs.contains(&"Store::run".to_string()), "{refs:?}");
+    }
+
+    /// 初始化運算式裡的名字指的是舊的綁定。
+    #[test]
+    fn a_binding_takes_effect_only_after_its_initialiser() {
+        let p = parse("fn caller(s: Store) {\n    let s = Writer { inner: s.take() };\n}\n");
+        assert!(
+            refs_of(&p, "caller").contains(&"Store::take".to_string()),
+            "{:?}",
+            refs_of(&p, "caller")
+        );
+    }
+
+    #[test]
+    fn a_typed_closure_parameter_is_tracked() {
+        let p = parse("fn caller() {\n    run(|s: Store| {\n        s.open();\n    });\n}\n");
+        assert!(refs_of(&p, "caller").contains(&"Store::open".to_string()));
     }
 
     #[test]
