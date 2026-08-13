@@ -1,0 +1,41 @@
+name: CodeGraph CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# 避免重複發起 PR 時舊的 CI 浪費資源
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-and-test:
+    name: Lint & Automated Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Enable Rust Cargo Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: 1. Check Code Formatting
+        run: cargo fmt --all -- --check
+
+      - name: 2. Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: 3. Run Unit & Integration Tests
+        run: cargo test --all-targets --all-features

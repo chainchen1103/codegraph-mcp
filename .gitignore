@@ -1,5 +1,40 @@
-.vscode/
+# ==========================================
+# 1. Rust & Build Artifacts
+# ==========================================
+/target/
+
+# ==========================================
+# 2. Local Indexing & AI Assistant Storage
+# ==========================================
 .claude/
 .codegraph/
-target/
 codegraph/
+
+# ==========================================
+# 3. Database & SQLite Transactions
+# ==========================================
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ==========================================
+# 4. Environment & Secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ==========================================
+# 5. IDEs & OS Junk Files
+# ==========================================
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+.DS_Store
+Thumbs.db
