@@ -63,27 +63,30 @@ impl Writer {
 
     /// 取得編譯單元的識別碼，必要時建立。
     pub fn unit(&mut self, conn: &Connection, name: &str) -> Result<u32> {
-        let id = self.units.intern(name);
-        for (id, name) in self.units.take_pending() {
+        let unit = self.units.intern(name);
+        if unit.is_new {
             conn.execute(
                 "INSERT OR IGNORE INTO units(id, name) VALUES (?1, ?2)",
-                rusqlite::params![id, name],
+                rusqlite::params![unit.id, name],
             )?;
         }
-        Ok(id)
+        Ok(unit.id)
     }
 
     /// 寫入單一檔案與其符號。
+    ///
+    /// `module_path` 是檔案在模組樹中的位置，由呼叫端算出：那是專案佈局
+    /// 的知識，不屬於這一層。
     pub fn write_file(
         &mut self,
         conn: &Connection,
         unit_id: u32,
         rel_path: &str,
+        module_path: &str,
         content_hash: &str,
         parse: &FileParse,
     ) -> Result<FileWritten> {
-        let file_id = self.paths.intern(rel_path);
-        self.paths.take_pending();
+        let file_id = self.paths.intern(rel_path).id;
 
         conn.execute(
             "INSERT OR REPLACE INTO files(id, path, unit_id, is_test, is_generated, content_hash, module_path, indexed_at)
@@ -94,23 +97,22 @@ impl Writer {
                 unit_id,
                 looks_like_test(rel_path) as i64,
                 content_hash,
-                crate::project::module_path(rel_path),
+                module_path,
                 now_millis(),
             ],
         )?;
 
-        let ids: Vec<u32> = parse
-            .symbols
-            .iter()
-            .map(|s| self.monikers.intern(&s.moniker))
-            .collect();
-
-        for (id, moniker) in self.monikers.take_pending() {
-            let handle = self.handle_for(&moniker);
-            conn.execute(
-                "INSERT INTO monikers(id, moniker, handle) VALUES (?1, ?2, ?3)",
-                rusqlite::params![id, moniker, handle],
-            )?;
+        let mut ids = Vec::with_capacity(parse.symbols.len());
+        for symbol in &parse.symbols {
+            let interned = self.monikers.intern(&symbol.moniker);
+            if interned.is_new {
+                let handle = self.handle_for(&symbol.moniker);
+                conn.execute(
+                    "INSERT INTO monikers(id, moniker, handle) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![interned.id, symbol.moniker, handle],
+                )?;
+            }
+            ids.push(interned.id);
         }
 
         let mut written = FileWritten::default();
@@ -244,7 +246,7 @@ mod tests {
                 Writer::reset(conn)?;
                 let unit = writer.unit(conn, "root")?;
                 for (path, parse) in files {
-                    writer.write_file(conn, unit, path, "hash", parse)?;
+                    writer.write_file(conn, unit, path, "", "hash", parse)?;
                 }
                 rebuild_fts(conn)
             })
@@ -344,6 +346,7 @@ mod tests {
                     conn,
                     unit,
                     "src/a.rs",
+                    "",
                     "hash",
                     &parse_of(vec![
                         symbol("src/a.rs:function:dup:1", "dup", 1),
@@ -393,6 +396,7 @@ mod tests {
                     conn,
                     unit,
                     "src/gone.rs",
+                    "",
                     "hash",
                     &parse_of(vec![symbol("src/gone.rs:function:old:1", "old", 1)]),
                 )
@@ -408,6 +412,7 @@ mod tests {
                     conn,
                     unit,
                     "src/kept.rs",
+                    "",
                     "hash",
                     &parse_of(vec![symbol("src/kept.rs:function:new:1", "new", 1)]),
                 )
@@ -437,6 +442,7 @@ mod tests {
                 conn,
                 unit,
                 "src/a.rs",
+                "",
                 "hash",
                 &parse_of(vec![symbol("src/a.rs:function:one:1", "one", 1)]),
             )?;

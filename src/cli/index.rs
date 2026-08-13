@@ -82,26 +82,14 @@ pub fn run(path: Option<&Path>) -> Result<String> {
 mod tests {
     use super::*;
     use crate::error::CgError;
-
-    fn tmp_project(tag: &str) -> Project {
-        let dir =
-            std::env::temp_dir().join(format!("codegraph-cli-index-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        Project::create(&dir).unwrap()
-    }
-
-    fn write(project: &Project, rel: &str, body: &str) {
-        let path = project.root().join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    }
+    use crate::testing::{cleanup, tmp_project, tmpdir};
 
     #[test]
     fn index_reports_what_it_wrote() {
-        let p = tmp_project("report");
-        write(&p, "src/a.rs", "fn one() {}\nfn two() {}\n");
+        let p = tmp_project(
+            "cli-index-report",
+            &[("src/a.rs", "fn one() {}\nfn two() {}\n")],
+        );
 
         let out = run(Some(p.root())).unwrap();
         assert!(out.contains("檔案      1"), "{out}");
@@ -109,28 +97,27 @@ mod tests {
         assert!(out.contains("耗時"), "{out}");
         assert!(!out.contains("警告"), "沒有問題時不該印警告：{out}");
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn warnings_are_listed_with_a_cap() {
-        let p = tmp_project("warnings");
-        for i in 0..(MAX_WARNINGS_SHOWN + 3) {
-            write(&p, &format!("src/bad{i}.rs"), "fn broken( {\n");
-        }
+        let broken: Vec<(String, &str)> = (0..(MAX_WARNINGS_SHOWN + 3))
+            .map(|i| (format!("src/bad{i}.rs"), "fn broken( {\n"))
+            .collect();
+        let files: Vec<(&str, &str)> = broken.iter().map(|(p, b)| (p.as_str(), *b)).collect();
+        let p = tmp_project("cli-index-warnings", &files);
 
         let out = run(Some(p.root())).unwrap();
         assert!(out.contains("警告"), "{out}");
         assert!(out.contains("還有 3 則"), "超出上限的警告要收合：{out}");
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn indexing_without_an_index_directory_is_a_recoverable_condition() {
-        let dir = std::env::temp_dir().join(format!("codegraph-cli-bare-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let dir = tmpdir("cli-index-bare");
 
         let err = run(Some(&dir)).unwrap_err();
         assert!(matches!(err, CgError::NotIndexed { .. }));

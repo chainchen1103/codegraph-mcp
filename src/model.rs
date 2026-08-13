@@ -10,10 +10,6 @@ pub struct SymbolId(pub u32);
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct FileId(pub u32);
 
-/// 編譯單元的識別碼，對應 `units.id`。
-#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct UnitId(pub u32);
-
 /// 符號種類。
 ///
 /// 判別值會寫進資料庫，只能往後追加，不可修改既有數值。
@@ -30,7 +26,6 @@ pub enum Kind {
     TypeAlias = 8,
     Const = 9,
     Module = 10,
-    File = 11,
 }
 
 impl Kind {
@@ -51,7 +46,6 @@ impl Kind {
             8 => TypeAlias,
             9 => Const,
             10 => Module,
-            11 => File,
             _ => return None,
         })
     }
@@ -72,7 +66,6 @@ impl Kind {
             TypeAlias => "type",
             Const => "const",
             Module => "module",
-            File => "file",
         }
     }
 }
@@ -140,39 +133,13 @@ impl Provenance {
     }
 }
 
-/// 已寫入資料庫的符號。
-#[derive(Clone, Debug)]
-pub struct Symbol {
-    pub id: SymbolId,
-    pub name: String,
-    pub kind: Kind,
-    pub file: FileId,
-    /// 起始行，1 起算。
-    pub start_line: u32,
-    /// 結束行，1 起算。
-    pub end_line: u32,
-    pub signature: Option<String>,
-    pub docstring: Option<String>,
-}
-
-/// 已寫入資料庫的邊。
-#[derive(Clone, Debug)]
-pub struct Relation {
-    pub src: SymbolId,
-    pub dst: SymbolId,
-    pub rel: Rel,
-    /// 引用發生的位置。合成的邊沒有位置。
-    pub file: Option<FileId>,
-    pub line: Option<u32>,
-    pub provenance: Provenance,
-    /// 合成器名稱與註冊位置，僅 [`Provenance::Heuristic`] 的邊使用。
-    pub meta: Option<String>,
-}
-
 /// 抽取階段產生的符號。
 ///
-/// 抽取層不存取資料庫，因此還沒有識別碼；與已寫入的符號之間靠
+/// 抽取層不存取資料庫，因此還沒有識別碼；寫入之後與資料列之間靠
 /// `moniker` 對應。
+///
+/// 讀取端不共用這個型別：每種查詢只取自己需要的欄位，組成自己的結果
+/// 型別。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawSymbol {
     /// 穩定識別碼，格式為 `路徑:kind:name:起始行`。
@@ -190,7 +157,7 @@ pub struct RawSymbol {
     pub docstring: Option<String>,
 }
 
-/// 抽取階段產生、尚未解析成 [`Relation`] 的引用。
+/// 抽取階段產生、尚未解析成邊的引用。
 ///
 /// 抽取層不做跨檔推論，只記錄引用的名字，解析由 resolve 層負責。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -220,7 +187,6 @@ mod tests {
             Kind::TypeAlias,
             Kind::Const,
             Kind::Module,
-            Kind::File,
         ] {
             assert_eq!(Kind::from_u8(k as u8), Some(k));
         }
@@ -271,7 +237,6 @@ mod tests {
             (Kind::TypeAlias, "type"),
             (Kind::Const, "const"),
             (Kind::Module, "module"),
-            (Kind::File, "file"),
         ];
         for (k, s) in pairs {
             assert_eq!(k.as_str(), s);
@@ -310,51 +275,16 @@ mod tests {
     fn ids_are_distinct_types_with_transparent_values() {
         let s = SymbolId(7);
         let f = FileId(7);
-        let u = UnitId(7);
         assert_eq!(s.0, 7);
         assert_eq!(f.0, 7);
-        assert_eq!(u.0, 7);
         assert_eq!(s, SymbolId(7));
         assert_ne!(s, SymbolId(8));
         assert!(SymbolId(1) < SymbolId(2));
     }
 
+    /// 抽取階段的產物靠 moniker 互相指涉，此時還沒有任何識別碼。
     #[test]
-    fn structs_carry_what_the_schema_needs() {
-        let sym = Symbol {
-            id: SymbolId(1),
-            name: "open".into(),
-            kind: Kind::Function,
-            file: FileId(2),
-            start_line: 10,
-            end_line: 20,
-            signature: Some("fn open(p: &Path) -> Result<Store>".into()),
-            docstring: None,
-        };
-        assert_eq!(sym.end_line - sym.start_line, 10);
-
-        let rel = Relation {
-            src: SymbolId(1),
-            dst: SymbolId(3),
-            rel: Rel::Calls,
-            file: Some(FileId(2)),
-            line: Some(12),
-            provenance: Provenance::Static,
-            meta: None,
-        };
-        assert_eq!(rel.provenance, Provenance::Static);
-
-        let synth = Relation {
-            src: SymbolId(1),
-            dst: SymbolId(4),
-            rel: Rel::Calls,
-            file: None,
-            line: None,
-            provenance: Provenance::Heuristic,
-            meta: Some("callback@src/a.rs:30".into()),
-        };
-        assert!(synth.meta.is_some());
-
+    fn extraction_output_refers_to_symbols_by_moniker() {
         let raw = RawRef {
             from: "src/a.rs:function:caller:1".into(),
             name: "utils.greet".into(),

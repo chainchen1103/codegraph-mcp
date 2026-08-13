@@ -5,8 +5,6 @@
 /// 一次查詢可以用掉的額度。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
-    /// 回答一個問題預期需要的查詢次數。
-    pub calls: usize,
     /// 單次查詢的輸出上限，以字元計。
     pub max_chars: usize,
     /// 同一個檔案在單次查詢中的輸出上限。
@@ -15,13 +13,12 @@ pub struct Budget {
 
 /// 分級表，依已索引的檔案數查表。
 ///
-/// 每一列是（檔案數上限, 查詢次數, 輸出上限, 單檔上限）。最後一列的
-/// 檔案數上限為 [`usize::MAX`]，涵蓋所有更大的專案。
+/// 每一列是（檔案數上限, 額度）。最後一列的檔案數上限為
+/// [`usize::MAX`]，涵蓋所有更大的專案。
 const TIERS: [(usize, Budget); 5] = [
     (
         500,
         Budget {
-            calls: 1,
             max_chars: 18_000,
             max_chars_per_file: 3_800,
         },
@@ -29,7 +26,6 @@ const TIERS: [(usize, Budget); 5] = [
     (
         5_000,
         Budget {
-            calls: 2,
             max_chars: 28_000,
             max_chars_per_file: 6_500,
         },
@@ -37,7 +33,6 @@ const TIERS: [(usize, Budget); 5] = [
     (
         15_000,
         Budget {
-            calls: 3,
             max_chars: 35_000,
             max_chars_per_file: 7_000,
         },
@@ -45,7 +40,6 @@ const TIERS: [(usize, Budget); 5] = [
     (
         25_000,
         Budget {
-            calls: 4,
             max_chars: 38_000,
             max_chars_per_file: 7_000,
         },
@@ -53,7 +47,6 @@ const TIERS: [(usize, Budget); 5] = [
     (
         usize::MAX,
         Budget {
-            calls: 5,
             max_chars: 38_000,
             max_chars_per_file: 7_000,
         },
@@ -82,14 +75,13 @@ mod tests {
 
     #[test]
     fn each_tier_is_selected_by_file_count() {
-        assert_eq!(for_file_count(0).calls, 1);
-        assert_eq!(for_file_count(499).calls, 1);
-        assert_eq!(for_file_count(500).calls, 2);
-        assert_eq!(for_file_count(4_999).calls, 2);
-        assert_eq!(for_file_count(5_000).calls, 3);
-        assert_eq!(for_file_count(15_000).calls, 4);
-        assert_eq!(for_file_count(25_000).calls, 5);
-        assert_eq!(for_file_count(usize::MAX).calls, 5);
+        assert_eq!(for_file_count(0).max_chars, 18_000);
+        assert_eq!(for_file_count(499).max_chars, 18_000);
+        assert_eq!(for_file_count(500).max_chars, 28_000);
+        assert_eq!(for_file_count(4_999).max_chars, 28_000);
+        assert_eq!(for_file_count(5_000).max_chars, 35_000);
+        assert_eq!(for_file_count(15_000).max_chars, 38_000);
+        assert_eq!(for_file_count(usize::MAX).max_chars, 38_000);
     }
 
     /// 大專案的每一項額度都不得小於小專案。
@@ -103,10 +95,6 @@ mod tests {
 
         for (limit, budget) in TIERS {
             if let Some(prev) = previous {
-                assert!(
-                    budget.calls >= prev.calls,
-                    "檔案數上限 {limit} 的查詢次數比前一級小"
-                );
                 assert!(
                     budget.max_chars >= prev.max_chars,
                     "檔案數上限 {limit} 的輸出上限比前一級小"

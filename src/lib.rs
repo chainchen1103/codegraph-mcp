@@ -14,12 +14,13 @@ pub mod project;
 pub mod resolve;
 pub mod store;
 
+#[cfg(test)]
+mod testing;
+
 pub use error::{CgError, NotIndexedReason, Result};
 pub use explore::{Exploration, budget::Budget};
 pub use extract::FileParse;
 pub use indexer::IndexReport;
-pub use model::{
-    FileId, Kind, Provenance, RawRef, RawSymbol, Rel, Relation, Symbol, SymbolId, UnitId,
-};
+pub use model::{FileId, Kind, Provenance, RawRef, RawSymbol, Rel, SymbolId};
 pub use project::Project;
 pub use store::{Stats, Store};

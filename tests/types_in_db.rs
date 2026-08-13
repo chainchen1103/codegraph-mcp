@@ -4,7 +4,7 @@
 //! 兩邊的對應一旦不一致，讀出來的圖會是錯的，而且不會產生任何錯誤。
 
 use code_graph::store::SCHEMA;
-use code_graph::{FileId, Kind, Provenance, RawRef, Rel, Relation, Symbol, SymbolId};
+use code_graph::{Kind, Provenance, RawRef, Rel};
 use rusqlite::Connection;
 
 fn db_with_one_file() -> Connection {
@@ -20,46 +20,21 @@ fn db_with_one_file() -> Connection {
     conn
 }
 
-fn insert_symbol(conn: &Connection, s: &Symbol) {
+fn insert_symbol(conn: &Connection, id: u32, name: &str, kind: Kind) {
     conn.execute(
-        "INSERT INTO symbols(id, name, kind, file_id, start_line, end_line, signature, docstring)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            s.id.0,
-            s.name,
-            s.kind as u8,
-            s.file.0,
-            s.start_line,
-            s.end_line,
-            s.signature,
-            s.docstring,
-        ],
+        "INSERT INTO symbols(id, name, qualified, kind, file_id, start_line, end_line)
+         VALUES (?1, ?2, ?2, ?3, 1, 1, 2)",
+        rusqlite::params![id, name, kind as u8],
     )
     .unwrap();
 }
 
-fn load_symbol(conn: &Connection, id: SymbolId) -> Symbol {
-    conn.query_row(
-        "SELECT id, name, kind, file_id, start_line, end_line, signature, docstring
-         FROM symbols WHERE id = ?1",
-        [id.0],
-        |r| {
-            let raw_kind: u8 = r.get(2)?;
-            Ok(Symbol {
-                id: SymbolId(r.get(0)?),
-                name: r.get(1)?,
-                // 未知的 kind 表示資料庫由較新的 schema 寫入，不做推測。
-                kind: Kind::from_u8(raw_kind)
-                    .unwrap_or_else(|| panic!("DB 裡有未知的 kind: {raw_kind}")),
-                file: FileId(r.get(3)?),
-                start_line: r.get(4)?,
-                end_line: r.get(5)?,
-                signature: r.get(6)?,
-                docstring: r.get(7)?,
-            })
-        },
-    )
-    .unwrap()
+/// 讀回 kind。未知的值表示資料庫由較新的 schema 寫入，不做推測。
+fn load_kind(conn: &Connection, id: u32) -> Kind {
+    let raw: u8 = conn
+        .query_row("SELECT kind FROM symbols WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap();
+    Kind::from_u8(raw).unwrap_or_else(|| panic!("資料庫裡有未知的 kind: {raw}"))
 }
 
 #[test]
@@ -76,83 +51,52 @@ fn every_kind_survives_a_round_trip_through_sqlite() {
         Kind::TypeAlias,
         Kind::Const,
         Kind::Module,
-        Kind::File,
     ];
 
     for (i, kind) in kinds.iter().enumerate() {
-        let id = SymbolId(i as u32 + 1);
-        insert_symbol(
-            &conn,
-            &Symbol {
-                id,
-                name: format!("sym_{i}"),
-                kind: *kind,
-                file: FileId(1),
-                start_line: 1,
-                end_line: 2,
-                signature: None,
-                docstring: None,
-            },
-        );
-        assert_eq!(load_symbol(&conn, id).kind, *kind);
+        let id = i as u32 + 1;
+        insert_symbol(&conn, id, &format!("sym_{i}"), *kind);
+        assert_eq!(load_kind(&conn, id), *kind);
     }
 }
 
 #[test]
 fn optional_fields_round_trip_as_null() {
     let conn = db_with_one_file();
-    insert_symbol(
-        &conn,
-        &Symbol {
-            id: SymbolId(1),
-            name: "bare".into(),
-            kind: Kind::Function,
-            file: FileId(1),
-            start_line: 1,
-            end_line: 2,
-            signature: None,
-            docstring: None,
-        },
-    );
-    insert_symbol(
-        &conn,
-        &Symbol {
-            id: SymbolId(2),
-            name: "documented".into(),
-            kind: Kind::Function,
-            file: FileId(1),
-            start_line: 5,
-            end_line: 9,
-            signature: Some("fn documented()".into()),
-            docstring: Some("說明文字".into()),
-        },
-    );
+    insert_symbol(&conn, 1, "bare", Kind::Function);
+    conn.execute(
+        "INSERT INTO symbols(id, name, qualified, kind, file_id, start_line, end_line,
+                             signature, docstring)
+         VALUES (2, 'documented', 'documented', 1, 1, 5, 9, 'fn documented()', '說明文字')",
+        [],
+    )
+    .unwrap();
 
-    let bare = load_symbol(&conn, SymbolId(1));
-    assert!(bare.signature.is_none() && bare.docstring.is_none());
+    let bare: (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT signature, docstring FROM symbols WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(bare, (None, None));
 
-    let doc = load_symbol(&conn, SymbolId(2));
-    assert_eq!(doc.signature.as_deref(), Some("fn documented()"));
-    assert_eq!(doc.docstring.as_deref(), Some("說明文字"));
+    let documented: (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT signature, docstring FROM symbols WHERE id = 2",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(documented.0.as_deref(), Some("fn documented()"));
+    assert_eq!(documented.1.as_deref(), Some("說明文字"));
 }
 
 #[test]
 fn every_rel_and_provenance_survives_a_round_trip() {
     let conn = db_with_one_file();
     for i in 1..=3u32 {
-        insert_symbol(
-            &conn,
-            &Symbol {
-                id: SymbolId(i),
-                name: format!("s{i}"),
-                kind: Kind::Function,
-                file: FileId(1),
-                start_line: i,
-                end_line: i + 1,
-                signature: None,
-                docstring: None,
-            },
-        );
+        insert_symbol(&conn, i, &format!("s{i}"), Kind::Function);
     }
 
     let rels = [
@@ -165,35 +109,17 @@ fn every_rel_and_provenance_survives_a_round_trip() {
     ];
 
     for (i, rel) in rels.iter().enumerate() {
-        let r = Relation {
-            src: SymbolId(1),
-            dst: SymbolId(2),
-            rel: *rel,
-            file: Some(FileId(1)),
-            line: Some(i as u32 + 1),
-            provenance: if i % 2 == 0 {
-                Provenance::Static
-            } else {
-                Provenance::Heuristic
-            },
-            meta: if i % 2 == 0 {
-                None
-            } else {
-                Some(format!("synth-{i}"))
-            },
+        // 交錯兩種來源，順便確認合成的邊一定帶著說明。
+        let (provenance, meta) = if i % 2 == 0 {
+            (Provenance::Static, None)
+        } else {
+            (Provenance::Heuristic, Some(format!("synth-{i}")))
         };
+
         conn.execute(
             "INSERT INTO relations(src, dst, rel, line, file_id, provenance, meta)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                r.src.0,
-                r.dst.0,
-                r.rel as u8,
-                r.line.map(|l| l as i64).unwrap_or(-1),
-                r.file.map(|f| f.0),
-                r.provenance as u8,
-                r.meta,
-            ],
+             VALUES (1, 2, ?1, ?2, 1, ?3, ?4)",
+            rusqlite::params![*rel as u8, i as i64 + 1, provenance as u8, meta],
         )
         .unwrap();
     }
@@ -216,13 +142,13 @@ fn every_rel_and_provenance_survives_a_round_trip() {
         .unwrap();
 
     assert_eq!(loaded.len(), rels.len());
-    for (i, (rel, prov, meta)) in loaded.iter().enumerate() {
+    for (i, (rel, provenance, meta)) in loaded.iter().enumerate() {
         assert_eq!(*rel, rels[i]);
         if i % 2 == 0 {
-            assert_eq!(*prov, Provenance::Static);
+            assert_eq!(*provenance, Provenance::Static);
             assert!(meta.is_none(), "靜態邊不該帶合成器資訊");
         } else {
-            assert_eq!(*prov, Provenance::Heuristic);
+            assert_eq!(*provenance, Provenance::Heuristic);
             assert!(meta.is_some(), "合成的邊必須記錄來源");
         }
     }
@@ -233,19 +159,7 @@ fn every_rel_and_provenance_survives_a_round_trip() {
 #[test]
 fn raw_refs_land_in_unresolved_with_a_usable_name_tail() {
     let conn = db_with_one_file();
-    insert_symbol(
-        &conn,
-        &Symbol {
-            id: SymbolId(1),
-            name: "caller".into(),
-            kind: Kind::Function,
-            file: FileId(1),
-            start_line: 1,
-            end_line: 5,
-            signature: None,
-            docstring: None,
-        },
-    );
+    insert_symbol(&conn, 1, "caller", Kind::Function);
 
     // 抽取階段只有 moniker，寫入前必須先 intern 成識別碼。
     let raw = RawRef {
@@ -254,13 +168,12 @@ fn raw_refs_land_in_unresolved_with_a_usable_name_tail() {
         rel: Rel::Calls,
         line: 3,
     };
-    let from_id = SymbolId(1);
     let tail = raw.name.rsplit('.').next().unwrap().to_string();
 
     conn.execute(
         "INSERT INTO unresolved_refs(from_id, ref_name, name_tail, rel, file_id, line, status)
-         VALUES (?1, ?2, ?3, ?4, 1, ?5, 1)",
-        rusqlite::params![from_id.0, raw.name, tail, raw.rel as u8, raw.line],
+         VALUES (1, ?1, ?2, ?3, 1, ?4, 1)",
+        rusqlite::params![raw.name, tail, raw.rel as u8, raw.line],
     )
     .unwrap();
 

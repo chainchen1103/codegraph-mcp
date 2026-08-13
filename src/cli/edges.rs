@@ -57,14 +57,14 @@ pub fn run(symbol: &str, direction: Direction, path: Option<&Path>) -> Result<St
             hit.start_line
         )
         .ok();
-        render(&mut out, direction, &found);
+        render_neighbours(&mut out, direction, &found);
         writeln!(out).ok();
     }
 
     Ok(out)
 }
 
-fn render(out: &mut String, direction: Direction, found: &[Neighbour]) {
+fn render_neighbours(out: &mut String, direction: Direction, found: &[Neighbour]) {
     if found.is_empty() {
         writeln!(out, "  沒有{}", direction.label()).ok();
         return;
@@ -95,25 +95,7 @@ fn render(out: &mut String, direction: Direction, found: &[Neighbour]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer;
-
-    fn tmp_project(tag: &str, files: &[(&str, &str)]) -> Project {
-        let dir =
-            std::env::temp_dir().join(format!("codegraph-cli-edges-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        let project = Project::create(&dir).unwrap();
-
-        for (rel, body) in files {
-            let path = project.root().join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, body).unwrap();
-        }
-
-        let mut store = Store::open(&project.db_path()).unwrap();
-        indexer::index_project(&project, &mut store).unwrap();
-        project
-    }
+    use crate::testing::{cleanup, indexed_project as tmp_project};
 
     #[test]
     fn callers_lists_the_call_sites_with_positions() {
@@ -130,7 +112,7 @@ mod tests {
         assert!(out.contains("caller"), "{out}");
         assert!(out.contains("src/b.rs:2"), "{out}");
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
@@ -146,7 +128,7 @@ mod tests {
         let out = run("caller", Direction::Callees, Some(p.root())).unwrap();
         assert!(out.contains("helper"), "{out}");
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
@@ -156,7 +138,7 @@ mod tests {
         let out = run("lonely", Direction::Callers, Some(p.root())).unwrap();
         assert!(out.contains("沒有呼叫者"), "{out}");
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     /// 同名的符號各自列出，不必先要求使用者消歧義。
@@ -177,7 +159,7 @@ mod tests {
         assert!(out.contains("function run"), "{out}");
         assert!(out.contains("method B::run"), "{out}");
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
@@ -188,6 +170,6 @@ mod tests {
         assert!(out.contains("查無結果"), "{out}");
         assert!(out.contains("target"), "{out}");
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 }

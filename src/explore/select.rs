@@ -101,17 +101,16 @@ pub fn select(conn: &Connection, query: &Query) -> Result<Selection> {
 /// 自己去翻檔案挑。查 `Store::open` 時裸名不可能相等，自然只會命中
 /// 那一個方法。
 fn by_name(conn: &Connection, name: &str, origin: Origin) -> Result<Vec<Hit>> {
-    for sql in [
-        "SELECT s.id, s.name, s.qualified, s.kind, f.path, s.start_line, s.end_line,
-                s.signature, s.docstring
-         FROM symbols s JOIN files f ON f.id = s.file_id
-         WHERE s.qualified = ?1 OR s.name = ?1",
-        "SELECT s.id, s.name, s.qualified, s.kind, f.path, s.start_line, s.end_line,
-                s.signature, s.docstring
-         FROM symbols s JOIN files f ON f.id = s.file_id
-         WHERE lower(s.qualified) = lower(?1) OR lower(s.name) = lower(?1)",
+    for condition in [
+        "s.qualified = ?1 OR s.name = ?1",
+        "lower(s.qualified) = lower(?1) OR lower(s.name) = lower(?1)",
     ] {
-        let hits = collect(conn, sql, rusqlite::params![name], origin)?;
+        let hits = collect(
+            conn,
+            &symbol_query(condition),
+            rusqlite::params![name],
+            origin,
+        )?;
         if !hits.is_empty() {
             return Ok(hits);
         }
@@ -122,24 +121,34 @@ fn by_name(conn: &Connection, name: &str, origin: Origin) -> Result<Vec<Hit>> {
 fn by_path(conn: &Connection, path: &str, origin: Origin) -> Result<Vec<Hit>> {
     let normalized = crate::extract::moniker::normalize_path(path);
 
-    for sql in [
-        "SELECT s.id, s.name, s.qualified, s.kind, f.path, s.start_line, s.end_line,
-                s.signature, s.docstring
-         FROM symbols s JOIN files f ON f.id = s.file_id
-         WHERE f.path = ?1",
+    for condition in [
+        "f.path = ?1",
         // 只給了檔名時，比對路徑結尾。
-        "SELECT s.id, s.name, s.qualified, s.kind, f.path, s.start_line, s.end_line,
-                s.signature, s.docstring
-         FROM symbols s JOIN files f ON f.id = s.file_id
-         WHERE f.path = ?1 OR f.path LIKE '%/' || ?1",
+        "f.path = ?1 OR f.path LIKE '%/' || ?1",
     ] {
-        let hits = collect(conn, sql, rusqlite::params![normalized], origin)?;
+        let hits = collect(
+            conn,
+            &symbol_query(condition),
+            rusqlite::params![normalized],
+            origin,
+        )?;
         if !hits.is_empty() {
             return Ok(hits);
         }
     }
     Ok(Vec::new())
 }
+
+/// 取出組成 [`Hit`] 所需欄位的查詢，條件由呼叫端給。
+///
+/// 條件只來自本檔案內的字面值，不含任何外部輸入。
+fn symbol_query(condition: &str) -> String {
+    format!("{SYMBOL_COLUMNS} FROM symbols s JOIN files f ON f.id = s.file_id WHERE {condition}")
+}
+
+/// [`Hit`] 需要的欄位，順序與 [`collect`] 的讀取順序一致。
+const SYMBOL_COLUMNS: &str = "SELECT s.id, s.name, s.qualified, s.kind, f.path,
+                                     s.start_line, s.end_line, s.signature, s.docstring";
 
 fn by_text(conn: &Connection, words: &[String], origin: Origin) -> Result<Vec<Hit>> {
     let expression = words
@@ -148,18 +157,19 @@ fn by_text(conn: &Connection, words: &[String], origin: Origin) -> Result<Vec<Hi
         .collect::<Vec<_>>()
         .join(" OR ");
 
-    let sql = "SELECT s.id, s.name, s.qualified, s.kind, f.path, s.start_line, s.end_line,
-                      s.signature, s.docstring
-               FROM symbols_fts
-               JOIN symbols s ON s.id = symbols_fts.rowid
-               JOIN files f ON f.id = s.file_id
-               WHERE symbols_fts MATCH ?1
-               ORDER BY bm25(symbols_fts)
-               LIMIT ?2";
+    let sql = format!(
+        "{SYMBOL_COLUMNS}
+         FROM symbols_fts
+         JOIN symbols s ON s.id = symbols_fts.rowid
+         JOIN files f ON f.id = s.file_id
+         WHERE symbols_fts MATCH ?1
+         ORDER BY bm25(symbols_fts)
+         LIMIT ?2"
+    );
 
     collect(
         conn,
-        sql,
+        &sql,
         rusqlite::params![expression, TEXT_SEARCH_LIMIT as i64],
         origin,
     )
@@ -262,19 +272,16 @@ mod tests {
     use super::*;
     use crate::explore::query;
     use crate::store::Store;
-    use crate::store::write::{Writer, rebuild_fts};
+    use crate::testing::indexed;
 
-    fn sample_store() -> Store {
-        let mut store = Store::in_memory().unwrap();
-        let mut writer = Writer::new();
-
-        let source = "\
+    const UTIL_RS: &str = "\
 /// 開啟資料庫
 pub fn open() -> u8 {
     1
 }
 ";
-        let store_source = "\
+
+    const STORE_RS: &str = "\
 pub struct Store;
 
 impl Store {
@@ -286,18 +293,9 @@ impl Store {
     pub fn close(&self) {}
 }
 ";
-        store
-            .with_transaction(|conn| {
-                Writer::reset(conn)?;
-                let unit = writer.unit(conn, "root")?;
-                for (path, text) in [("src/util.rs", source), ("src/store.rs", store_source)] {
-                    let parse = crate::extract::extract(path, text).unwrap();
-                    writer.write_file(conn, unit, path, "hash", &parse)?;
-                }
-                rebuild_fts(conn)
-            })
-            .unwrap();
-        store
+
+    fn sample_store() -> Store {
+        indexed(&[("src/util.rs", UTIL_RS), ("src/store.rs", STORE_RS)])
     }
 
     fn run(store: &Store, input: &str) -> Selection {

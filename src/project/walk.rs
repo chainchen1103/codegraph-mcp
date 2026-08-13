@@ -84,20 +84,7 @@ fn is_inside_index_dir(root: &Path, path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmp_project(tag: &str) -> Project {
-        let dir = std::env::temp_dir().join(format!("codegraph-walk-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        Project::create(&dir).unwrap()
-    }
-
-    fn write(project: &Project, rel: &str, body: &str) {
-        let path = project.root().join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    }
+    use crate::testing::{cleanup, tmp_project, write};
 
     fn paths(project: &Project) -> Vec<String> {
         source_files(project)
@@ -108,54 +95,54 @@ mod tests {
 
     #[test]
     fn only_supported_extensions_are_listed() {
-        let p = tmp_project("ext");
+        let p = tmp_project("walk-ext", &[]);
         write(&p, "src/a.rs", "fn a() {}\n");
         write(&p, "README.md", "# hi\n");
         write(&p, "Cargo.toml", "[package]\n");
 
         assert_eq!(paths(&p), vec!["src/a.rs"]);
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn results_are_sorted_by_path() {
-        let p = tmp_project("sorted");
+        let p = tmp_project("walk-sorted", &[]);
         for rel in ["src/z.rs", "src/a.rs", "src/m/b.rs"] {
             write(&p, rel, "fn f() {}\n");
         }
 
         assert_eq!(paths(&p), vec!["src/a.rs", "src/m/b.rs", "src/z.rs"]);
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn gitignored_files_are_skipped() {
-        let p = tmp_project("ignore");
+        let p = tmp_project("walk-ignore", &[]);
         write(&p, ".gitignore", "generated/\n");
         write(&p, "src/a.rs", "fn a() {}\n");
         write(&p, "generated/big.rs", "fn g() {}\n");
 
         assert_eq!(paths(&p), vec!["src/a.rs"]);
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn the_index_directory_is_never_walked() {
-        let p = tmp_project("selfindex");
+        let p = tmp_project("walk-selfindex", &[]);
         write(&p, "src/a.rs", "fn a() {}\n");
         std::fs::write(p.dir().join("leftover.rs"), "fn x() {}\n").unwrap();
 
         assert_eq!(paths(&p), vec!["src/a.rs"]);
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn oversized_files_are_skipped() {
-        let p = tmp_project("big");
+        let p = tmp_project("walk-big", &[]);
         write(&p, "src/small.rs", "fn a() {}\n");
         let big = format!("fn b() {{}}\n{}", "// x\n".repeat(500_000));
         assert!(big.len() as u64 > MAX_FILE_BYTES);
@@ -163,12 +150,12 @@ mod tests {
 
         assert_eq!(paths(&p), vec!["src/small.rs"]);
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn sizes_are_reported_for_each_file() {
-        let p = tmp_project("size");
+        let p = tmp_project("walk-size", &[]);
         let body = "fn a() {}\n";
         write(&p, "src/a.rs", body);
 
@@ -177,13 +164,13 @@ mod tests {
         assert_eq!(files[0].size, body.len() as u64);
         assert!(files[0].absolute(&p).is_file());
 
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn an_empty_project_yields_nothing() {
-        let p = tmp_project("empty");
+        let p = tmp_project("walk-empty", &[]);
         assert!(source_files(&p).is_empty());
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 }

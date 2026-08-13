@@ -66,20 +66,11 @@ fn human_size(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::error::CgError;
-
-    /// `.git` 作為 repo 邊界，避免測試往上找到家目錄的索引。
-    fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("codegraph-status-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        dir
-    }
+    use crate::testing::tmpdir;
 
     #[test]
     fn status_on_an_empty_index_says_it_is_empty() {
-        let root = tmpdir("empty");
+        let root = tmpdir("cli-status-empty");
         crate::cli::init::run(Some(&root)).unwrap();
 
         let out = run(Some(&root)).unwrap();
@@ -92,7 +83,7 @@ mod tests {
 
     #[test]
     fn status_reports_counts_and_base_commit() {
-        let root = tmpdir("populated");
+        let root = tmpdir("cli-status-populated");
         crate::cli::init::run(Some(&root)).unwrap();
         let project = Project::discover(&root).unwrap();
 
@@ -127,7 +118,7 @@ mod tests {
 
     #[test]
     fn status_without_an_index_is_a_recoverable_condition() {
-        let root = tmpdir("bare");
+        let root = tmpdir("cli-status-bare");
         let err = run(Some(&root)).unwrap_err();
         assert!(matches!(err, CgError::NotIndexed { .. }));
         assert!(err.is_recoverable());

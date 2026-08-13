@@ -168,25 +168,11 @@ fn strip_verbatim(p: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// 建立帶有 repo 邊界的暫存目錄。
-    ///
-    /// 暫存目錄位於使用者家目錄底下，而家目錄可能自己就有索引目錄。
-    /// 沒有 `.git` 邊界時，「找不到索引」的測試會撞到那份索引。
-    fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "codegraph-project-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        dir
-    }
+    use crate::testing::tmpdir;
 
     #[test]
     fn create_makes_the_directory_and_a_config_template() {
-        let root = tmpdir("create");
+        let root = tmpdir("project-create");
         let p = Project::create(&root).unwrap();
 
         assert!(p.dir().is_dir());
@@ -203,7 +189,7 @@ mod tests {
 
     #[test]
     fn create_is_idempotent_and_never_clobbers_an_edited_config() {
-        let root = tmpdir("idempotent");
+        let root = tmpdir("project-idempotent");
         let p = Project::create(&root).unwrap();
         std::fs::write(p.config_path(), "# 使用者改過的設定\n").unwrap();
 
@@ -220,7 +206,7 @@ mod tests {
 
     #[test]
     fn discover_walks_up_from_a_nested_directory() {
-        let root = tmpdir("discover");
+        let root = tmpdir("project-discover");
         Project::create(&root).unwrap();
         let nested = root.join("src").join("deep").join("deeper");
         std::fs::create_dir_all(&nested).unwrap();
@@ -233,7 +219,7 @@ mod tests {
 
     #[test]
     fn discover_reports_not_indexed_instead_of_failing_hard() {
-        let root = tmpdir("bare");
+        let root = tmpdir("project-bare");
         let err = Project::discover(&root).unwrap_err();
         assert!(
             matches!(err, CgError::NotIndexed { .. }),
@@ -246,7 +232,7 @@ mod tests {
 
     #[test]
     fn discover_stops_at_the_repo_boundary() {
-        let outer = tmpdir("boundary");
+        let outer = tmpdir("project-boundary");
         Project::create(&outer).unwrap();
 
         let inner = outer.join("vendor").join("nested-repo");
@@ -270,7 +256,7 @@ mod tests {
 
     #[test]
     fn discover_still_matches_at_the_boundary_directory_itself() {
-        let root = tmpdir("at-boundary");
+        let root = tmpdir("project-at-boundary");
         Project::create(&root).unwrap();
         let nested = root.join("src");
         std::fs::create_dir_all(&nested).unwrap();
@@ -285,7 +271,7 @@ mod tests {
 
     #[test]
     fn is_initialized_reflects_the_directory() {
-        let root = tmpdir("flag");
+        let root = tmpdir("project-flag");
         assert!(!Project::is_initialized(&root));
         Project::create(&root).unwrap();
         assert!(Project::is_initialized(&root));
@@ -295,7 +281,7 @@ mod tests {
 
     #[test]
     fn paths_are_stored_relative_to_the_root() {
-        let root = tmpdir("relativize");
+        let root = tmpdir("project-relativize");
         let p = Project::create(&root).unwrap();
 
         let inside = p.root().join("src").join("main.rs");

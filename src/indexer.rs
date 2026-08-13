@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::extract;
-use crate::project::{Project, walk};
+use crate::project::{self, Project, walk};
 use crate::resolve::{self, ResolveReport};
 use crate::store::Store;
 use crate::store::write::{Writer, rebuild_fts};
@@ -87,7 +87,8 @@ pub fn index_project(project: &Project, store: &mut Store) -> Result<IndexReport
             let unit = writer.unit(conn, DEFAULT_UNIT)?;
             let mut totals = (0usize, 0usize, 0usize);
             for (rel_path, hash, parse) in &parsed {
-                let w = writer.write_file(conn, unit, rel_path, hash, parse)?;
+                let module = project::module_path(rel_path);
+                let w = writer.write_file(conn, unit, rel_path, &module, hash, parse)?;
                 totals.0 += 1;
                 totals.1 += w.symbols;
                 totals.2 += w.skipped;
@@ -116,21 +117,7 @@ fn content_hash(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn tmp_project(tag: &str) -> Project {
-        let dir =
-            std::env::temp_dir().join(format!("codegraph-indexer-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        Project::create(&dir).unwrap()
-    }
-
-    fn write(project: &Project, rel: &str, body: &str) {
-        let path = project.root().join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    }
+    use crate::testing::{cleanup, tmp_project, write};
 
     fn index(project: &Project) -> (IndexReport, Store) {
         let mut store = Store::open(&project.db_path()).unwrap();
@@ -140,7 +127,7 @@ mod tests {
 
     #[test]
     fn indexing_writes_every_supported_file() {
-        let p = tmp_project("basic");
+        let p = tmp_project("indexer-basic", &[]);
         write(&p, "src/a.rs", "fn one() {}\nfn two() {}\n");
         write(&p, "src/b.rs", "struct S;\n");
         write(&p, "README.md", "# 不是原始碼\n");
@@ -155,12 +142,12 @@ mod tests {
         assert_eq!(stats.symbols, 3);
 
         drop(store);
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn reindexing_replaces_rather_than_accumulates() {
-        let p = tmp_project("reindex");
+        let p = tmp_project("indexer-reindex", &[]);
         write(&p, "src/a.rs", "fn one() {}\n");
 
         let (first, store) = index(&p);
@@ -171,12 +158,12 @@ mod tests {
         assert_eq!(store.stats().unwrap().symbols, 1, "重複索引把資料疊加了");
 
         drop(store);
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn deleted_files_disappear_from_the_index() {
-        let p = tmp_project("deleted");
+        let p = tmp_project("indexer-deleted", &[]);
         write(&p, "src/a.rs", "fn one() {}\n");
         write(&p, "src/b.rs", "fn two() {}\n");
 
@@ -190,12 +177,12 @@ mod tests {
         assert_eq!(store.stats().unwrap().symbols, 1);
 
         drop(store);
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn indexing_is_deterministic() {
-        let p = tmp_project("deterministic");
+        let p = tmp_project("indexer-deterministic", &[]);
         write(&p, "src/a.rs", "fn one() {}\n");
         write(&p, "src/b.rs", "fn two() {}\n");
 
@@ -220,12 +207,12 @@ mod tests {
         assert_eq!(first, second, "兩次索引配發了不同的識別碼");
 
         drop(store);
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn syntax_errors_are_reported_but_do_not_stop_the_run() {
-        let p = tmp_project("broken");
+        let p = tmp_project("indexer-broken", &[]);
         write(&p, "src/good.rs", "fn good() {}\n");
         write(&p, "src/bad.rs", "fn broken( {\n");
 
@@ -239,12 +226,12 @@ mod tests {
         assert!(store.stats().unwrap().symbols >= 1);
 
         drop(store);
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn non_utf8_files_are_reported_and_skipped() {
-        let p = tmp_project("binary");
+        let p = tmp_project("indexer-binary", &[]);
         write(&p, "src/good.rs", "fn good() {}\n");
         std::fs::write(p.root().join("src/bad.rs"), [0xff, 0xfe, 0x00, 0x01]).unwrap();
 
@@ -257,12 +244,12 @@ mod tests {
         );
 
         drop(store);
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn an_empty_project_produces_an_empty_index() {
-        let p = tmp_project("empty");
+        let p = tmp_project("indexer-empty", &[]);
         let (report, store) = index(&p);
 
         assert_eq!(report.files, 0);
@@ -270,12 +257,12 @@ mod tests {
         assert!(store.stats().unwrap().is_empty());
 
         drop(store);
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]
     fn the_index_records_when_it_was_built() {
-        let p = tmp_project("timestamp");
+        let p = tmp_project("indexer-timestamp", &[]);
         write(&p, "src/a.rs", "fn one() {}\n");
 
         let (_, store) = index(&p);
@@ -283,7 +270,7 @@ mod tests {
         assert!(recorded.parse::<i64>().unwrap() > 1_577_836_800_000);
 
         drop(store);
-        std::fs::remove_dir_all(p.root()).ok();
+        cleanup(&p);
     }
 
     #[test]

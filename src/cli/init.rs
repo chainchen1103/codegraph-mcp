@@ -36,21 +36,15 @@ pub fn run(path: Option<&Path>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::tmpdir;
 
     fn code_graph_schema_version() -> i64 {
         crate::store::SCHEMA_VERSION
     }
 
-    fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("codegraph-init-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn init_creates_everything_a_later_command_needs() {
-        let root = tmpdir("fresh");
+        let root = tmpdir("cli-init-fresh");
         let out = run(Some(&root)).unwrap();
 
         assert!(out.contains("已建立索引目錄"));
@@ -65,7 +59,7 @@ mod tests {
 
     #[test]
     fn init_says_so_when_it_is_a_no_op() {
-        let root = tmpdir("twice");
+        let root = tmpdir("cli-init-twice");
         run(Some(&root)).unwrap();
         let out = run(Some(&root)).unwrap();
 
@@ -79,7 +73,7 @@ mod tests {
 
     #[test]
     fn init_never_wipes_an_existing_index() {
-        let root = tmpdir("preserve");
+        let root = tmpdir("cli-init-preserve");
         run(Some(&root)).unwrap();
 
         let project = Project::discover(&root).unwrap();

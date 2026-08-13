@@ -148,26 +148,7 @@ fn mark_failed(conn: &Connection, row: &Pending) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract;
-    use crate::store::write::{Writer, rebuild_fts};
-
-    fn indexed(files: &[(&str, &str)]) -> Store {
-        let mut store = Store::in_memory().unwrap();
-        let mut writer = Writer::new();
-
-        store
-            .with_transaction(|conn| {
-                Writer::reset(conn)?;
-                let unit = writer.unit(conn, "root")?;
-                for (path, text) in files {
-                    let parse = extract::extract(path, text).unwrap();
-                    writer.write_file(conn, unit, path, "hash", &parse)?;
-                }
-                rebuild_fts(conn)
-            })
-            .unwrap();
-        store
-    }
+    use crate::testing::indexed;
 
     fn edges(store: &Store) -> Vec<(String, String, i64)> {
         let mut stmt = store

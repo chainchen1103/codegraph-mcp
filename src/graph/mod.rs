@@ -75,29 +75,8 @@ fn neighbours(conn: &Connection, sql: &str, symbol: SymbolId, rel: Rel) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extract;
-    use crate::resolve;
     use crate::store::Store;
-    use crate::store::write::{Writer, rebuild_fts};
-
-    fn indexed(files: &[(&str, &str)]) -> Store {
-        let mut store = Store::in_memory().unwrap();
-        let mut writer = Writer::new();
-
-        store
-            .with_transaction(|conn| {
-                Writer::reset(conn)?;
-                let unit = writer.unit(conn, "root")?;
-                for (path, text) in files {
-                    let parse = extract::extract(path, text).unwrap();
-                    writer.write_file(conn, unit, path, "hash", &parse)?;
-                }
-                rebuild_fts(conn)
-            })
-            .unwrap();
-        resolve::resolve_all(&mut store).unwrap();
-        store
-    }
+    use crate::testing::resolved as indexed;
 
     fn id_of(store: &Store, qualified: &str) -> SymbolId {
         SymbolId(

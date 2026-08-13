@@ -15,18 +15,9 @@ pub struct Query {
 }
 
 impl Query {
+    /// 沒有任何可查的內容。
     pub fn is_empty(&self) -> bool {
         self.names.is_empty() && self.paths.is_empty() && self.text.is_empty()
-    }
-
-    /// 使用者輸入的所有詞，維持原本的順序。
-    pub fn tokens(&self) -> Vec<&str> {
-        self.names
-            .iter()
-            .chain(&self.paths)
-            .chain(&self.text)
-            .map(String::as_str)
-            .collect()
     }
 }
 
@@ -129,10 +120,6 @@ mod tests {
         assert_eq!(q.names, vec!["Store::open"]);
         assert_eq!(q.paths, vec!["src/store/mod.rs"]);
         assert_eq!(q.text, vec!["怎麼運作"]);
-        assert_eq!(
-            q.tokens(),
-            vec!["Store::open", "src/store/mod.rs", "怎麼運作"]
-        );
     }
 
     #[test]

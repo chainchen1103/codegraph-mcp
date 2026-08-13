@@ -223,10 +223,9 @@ mod tests {
     use crate::explore::select::Origin;
     use crate::model::{Kind, SymbolId};
 
+    /// 一個帶 `src/` 的暫存目錄，測試在裡面放要被讀取的原始碼。
     fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("codegraph-render-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testing::tmpdir(&format!("render-{tag}"));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         dir
     }

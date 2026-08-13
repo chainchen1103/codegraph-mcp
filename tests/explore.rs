@@ -1,43 +1,18 @@
 //! 查詢的整合測試：索引之後用名字、路徑與自然語言取回原始碼。
 
+mod common;
+
 use code_graph::explore;
-use code_graph::indexer;
-use code_graph::project::Project;
-use code_graph::store::Store;
+use common::Fixture;
 
-struct Fixture {
-    project: Project,
-    store: Store,
+/// 索引好的專案加上查詢入口。
+trait Ask {
+    fn ask(&self, input: &str) -> explore::Exploration;
 }
 
-impl Fixture {
-    fn new(tag: &str, files: &[(&str, &str)]) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("codegraph-it-explore-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        let project = Project::create(&dir).unwrap();
-
-        for (rel, body) in files {
-            let path = project.root().join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, body).unwrap();
-        }
-
-        let mut store = Store::open(&project.db_path()).unwrap();
-        indexer::index_project(&project, &mut store).unwrap();
-
-        Self { project, store }
-    }
-
+impl Ask for Fixture {
     fn ask(&self, input: &str) -> explore::Exploration {
-        explore::explore(&self.project, &self.store, input).unwrap()
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(self.project.root()).ok();
+        explore::explore(&self.project, &self.store(), input).unwrap()
     }
 }
 
@@ -70,7 +45,7 @@ pub fn helper() {}
 ";
 
 fn fixture(tag: &str) -> Fixture {
-    Fixture::new(tag, &[("src/store.rs", STORE_RS), ("src/util.rs", UTIL_RS)])
+    Fixture::indexed(tag, &[("src/store.rs", STORE_RS), ("src/util.rs", UTIL_RS)])
 }
 
 #[test]
@@ -211,7 +186,7 @@ fn a_symbol_deep_inside_a_huge_file_is_returned_on_its_own() {
     assert!(filler.len() > 400_000, "測試檔案不夠大");
 
     let source = format!("{filler}pub fn needle() -> u32 {{\n    42\n}}\n");
-    let f = Fixture::new("huge", &[("src/huge.rs", &source)]);
+    let f = Fixture::indexed("explore-huge", &[("src/huge.rs", &source)]);
 
     let out = f.ask("needle");
 
@@ -234,7 +209,7 @@ fn results_beyond_the_budget_are_reported_not_silently_dropped() {
     let source: String = (0..60)
         .map(|i| format!("pub fn wide{i}() {{\n{body}}}\n"))
         .collect();
-    let f = Fixture::new("budget", &[("src/wide.rs", &source)]);
+    let f = Fixture::indexed("explore-budget", &[("src/wide.rs", &source)]);
 
     let out = f.ask("src/wide.rs");
 

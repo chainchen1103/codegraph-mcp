@@ -46,7 +46,7 @@ pub fn explore(project: &Project, store: &Store, input: &str) -> Result<Explorat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer;
+    use crate::testing::{cleanup, indexed_project};
 
     struct Fixture {
         project: Project,
@@ -55,21 +55,8 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str, files: &[(&str, &str)]) -> Self {
-            let dir = std::env::temp_dir()
-                .join(format!("codegraph-explore-{tag}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(dir.join(".git")).unwrap();
-            let project = Project::create(&dir).unwrap();
-
-            for (rel, body) in files {
-                let path = project.root().join(rel);
-                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-                std::fs::write(path, body).unwrap();
-            }
-
-            let mut store = Store::open(&project.db_path()).unwrap();
-            indexer::index_project(&project, &mut store).unwrap();
-
+            let project = indexed_project(&format!("explore-{tag}"), files);
+            let store = Store::open(&project.db_path()).unwrap();
             Self { project, store }
         }
 
@@ -80,7 +67,7 @@ mod tests {
 
     impl Drop for Fixture {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(self.project.root()).ok();
+            cleanup(&self.project);
         }
     }
 

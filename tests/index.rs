@@ -1,50 +1,13 @@
 //! 全量索引的整合測試：走訪、抽取、寫入三層串起來的行為。
 
-use code_graph::indexer;
-use code_graph::project::Project;
+mod common;
+
 use code_graph::store::Store;
-
-struct Fixture {
-    project: Project,
-}
-
-impl Fixture {
-    fn new(tag: &str) -> Self {
-        let dir =
-            std::env::temp_dir().join(format!("codegraph-it-index-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".git")).unwrap();
-        Self {
-            project: Project::create(&dir).unwrap(),
-        }
-    }
-
-    fn write(&self, rel: &str, body: &str) {
-        let path = self.project.root().join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, body).unwrap();
-    }
-
-    fn index(&self) -> (indexer::IndexReport, Store) {
-        let mut store = Store::open(&self.project.db_path()).unwrap();
-        let report = indexer::index_project(&self.project, &mut store).unwrap();
-        (report, store)
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(self.project.root()).ok();
-    }
-}
-
-fn query_one<T: rusqlite::types::FromSql>(store: &Store, sql: &str) -> T {
-    store.conn().query_row(sql, [], |r| r.get(0)).unwrap()
-}
+use common::{Fixture, query_one};
 
 #[test]
 fn a_small_project_is_indexed_end_to_end() {
-    let f = Fixture::new("small");
+    let f = Fixture::new("index-small", &[]);
     f.write(
         "src/store.rs",
         "/// 開啟資料庫\npub struct Store;\n\nimpl Store {\n    pub fn open() -> Store {\n        Store\n    }\n}\n",
@@ -69,7 +32,7 @@ fn a_small_project_is_indexed_end_to_end() {
 
 #[test]
 fn every_symbol_is_reachable_through_full_text_search() {
-    let f = Fixture::new("fts");
+    let f = Fixture::new("index-fts", &[]);
     f.write(
         "src/a.rs",
         "/// 建立索引\npub fn build_index(root: &str) -> usize {\n    0\n}\n",
@@ -88,7 +51,7 @@ fn every_symbol_is_reachable_through_full_text_search() {
 
 #[test]
 fn file_rows_carry_the_path_and_content_hash() {
-    let f = Fixture::new("files");
+    let f = Fixture::new("index-files", &[]);
     f.write("src/a.rs", "fn a() {}\n");
 
     let (_, store) = f.index();
@@ -105,7 +68,7 @@ fn file_rows_carry_the_path_and_content_hash() {
 
 #[test]
 fn every_symbol_has_a_unique_handle() {
-    let f = Fixture::new("handles");
+    let f = Fixture::new("index-handles", &[]);
     for i in 0..40 {
         f.write(&format!("src/m{i}.rs"), &format!("fn f{i}() {{}}\n"));
     }
@@ -122,7 +85,7 @@ fn every_symbol_has_a_unique_handle() {
 
 #[test]
 fn editing_a_file_updates_its_symbols() {
-    let f = Fixture::new("edit");
+    let f = Fixture::new("index-edit", &[]);
     f.write("src/a.rs", "fn before() {}\n");
 
     {
@@ -141,7 +104,7 @@ fn editing_a_file_updates_its_symbols() {
 
 #[test]
 fn gitignored_directories_never_reach_the_index() {
-    let f = Fixture::new("ignored");
+    let f = Fixture::new("index-ignored", &[]);
     f.write(".gitignore", "vendor/\n");
     f.write("src/a.rs", "fn mine() {}\n");
     f.write("vendor/lib.rs", "fn theirs() {}\n");
@@ -155,7 +118,7 @@ fn gitignored_directories_never_reach_the_index() {
 
 #[test]
 fn test_files_are_flagged_so_they_can_be_filtered_later() {
-    let f = Fixture::new("testflag");
+    let f = Fixture::new("index-testflag", &[]);
     f.write("src/a.rs", "fn production() {}\n");
     f.write("tests/a.rs", "fn checks() {}\n");
 
@@ -168,7 +131,7 @@ fn test_files_are_flagged_so_they_can_be_filtered_later() {
 /// 索引結果與檔案系統的列舉順序無關，兩次索引的識別碼必須一致。
 #[test]
 fn two_runs_produce_the_same_identifiers() {
-    let f = Fixture::new("stable");
+    let f = Fixture::new("index-stable", &[]);
     for name in ["c", "a", "b"] {
         f.write(&format!("src/{name}.rs"), &format!("fn {name}() {{}}\n"));
     }
@@ -205,7 +168,7 @@ fn two_runs_produce_the_same_identifiers() {
 
 #[test]
 fn symbols_never_outlive_the_file_they_came_from() {
-    let f = Fixture::new("cascade");
+    let f = Fixture::new("index-cascade", &[]);
     f.write("src/a.rs", "fn a() {}\n");
     f.write("src/b.rs", "fn b() {}\n");
 

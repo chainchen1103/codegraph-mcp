@@ -89,12 +89,9 @@ fn render(rel: &str, parse: &extract::FileParse) -> String {
 mod tests {
     use super::*;
 
+    /// 一個孤立的原始碼檔案。outline 不需要專案，直接讀檔就能跑。
     fn tmpfile(tag: &str, name: &str, body: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("codegraph-outline-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
+        let path = crate::testing::tmpdir(&format!("outline-{tag}")).join(name);
         std::fs::write(&path, body).unwrap();
         path
     }
