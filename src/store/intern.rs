@@ -26,10 +26,23 @@ pub struct Interned {
 impl Interner {
     /// 建立一個從 1 開始配發識別碼的字串池。
     pub fn new() -> Self {
+        Self::continuing_from(0)
+    }
+
+    /// 建立一個接在既有識別碼之後配發的字串池。
+    ///
+    /// 增量寫入接續既有的索引，識別碼必須從資料庫目前的最大值續號，
+    /// 否則新符號會蓋掉舊符號。
+    pub fn continuing_from(highest: u32) -> Self {
         Self {
             map: HashMap::new(),
-            next: 1,
+            next: highest + 1,
         }
+    }
+
+    /// 記下一組資料庫裡已有的對應，不配發新的識別碼。
+    pub fn preload(&mut self, s: &str, id: u32) {
+        self.map.insert(s.into(), id);
     }
 
     /// 取得字串的識別碼，必要時配發新的。
@@ -79,6 +92,26 @@ mod tests {
         assert!(i.intern("a").is_new);
         assert!(i.intern("b").is_new);
         assert!(!i.intern("a").is_new);
+    }
+
+    /// 增量寫入接在既有索引之後，不得重用已經發出去的識別碼。
+    #[test]
+    fn resuming_allocates_past_the_existing_ids() {
+        let mut i = Interner::continuing_from(7);
+        assert_eq!(i.intern("first").id, 8);
+        assert_eq!(i.intern("second").id, 9);
+    }
+
+    /// 資料庫裡已有的對應要能塞回來，才不會被當成新字串又寫一次。
+    #[test]
+    fn preloaded_strings_are_reused_not_reallocated() {
+        let mut i = Interner::continuing_from(5);
+        i.preload("known", 3);
+
+        let found = i.intern("known");
+        assert_eq!(found.id, 3);
+        assert!(!found.is_new);
+        assert_eq!(i.intern("fresh").id, 6, "續號沒有跳過既有的識別碼");
     }
 
     #[test]

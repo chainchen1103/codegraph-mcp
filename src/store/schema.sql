@@ -89,8 +89,11 @@ CREATE TABLE IF NOT EXISTS relations (
 -- 未解析引用
 -- ============================================================
 
--- status 0 表示待解析，1 表示嘗試過但找不到目標。找不到的列會保留，
--- 之後有新符號加入時重試。
+-- status 0 待解析，1 有多個候選無法確定，2 索引裡沒有這個名字。
+--
+-- 1 與 2 都保留下來：增量同步只寫一個檔案，現在找不到的目標可能只是
+-- 還沒輪到它被寫進來，新符號出現時要能重試。全量索引則直接丟棄 2，
+-- 那時所有符號都已寫入，找不到就是專案外部的東西。
 --
 -- name_tail 是 ref_name 的最後一段，例如 util.greet 取 greet，供重試
 -- 時以新符號的名字反查。
@@ -158,9 +161,10 @@ CREATE INDEX IF NOT EXISTS idx_symbols_name   ON symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_qualified ON symbols(qualified);
 CREATE INDEX IF NOT EXISTS idx_files_unit     ON files(unit_id);
 CREATE INDEX IF NOT EXISTS idx_files_module   ON files(module_path);
--- 部分索引：只有待重試的列會被掃到。
+-- 部分索引：只有待重試的列會被掃到。status 0 的列正要被解析，不需要
+-- 靠名字反查。
 CREATE INDEX IF NOT EXISTS idx_unresolved_tail
-    ON unresolved_refs(name_tail) WHERE status = 1;
+    ON unresolved_refs(name_tail) WHERE status > 0;
 
 -- ============================================================
 -- 專案中繼資料

@@ -10,8 +10,21 @@ use crate::store::Store;
 
 /// 待解析狀態。
 const STATUS_PENDING: i64 = 0;
-/// 嘗試過但無法確定目標，保留以便日後重試。
+/// 有多個候選，無法確定目標，保留以便日後重試。
 const STATUS_FAILED: i64 = 1;
+/// 索引裡沒有這個名字，保留以便新符號出現時重試。
+const STATUS_EXTERNAL: i64 = 2;
+
+/// 索引裡找不到目標時的處置。
+///
+/// 兩條路徑對「找不到」的意義判斷不同，這個差別必須由呼叫端表明。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Unknown {
+    /// 丟棄。全量索引結束時所有符號都已寫入，找不到就是專案外部的東西。
+    Discard,
+    /// 留著。增量同步只寫了一個檔案，目標可能只是還沒輪到它被寫進來。
+    Keep,
+}
 
 /// 一次解析的結果。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,35 +59,66 @@ impl ResolveReport {
 /// 專案外部的東西，直接丟棄；有多個候選的則保留下來，讓使用者知道
 /// 圖在這裡是不完整的。
 pub fn resolve_all(store: &mut Store) -> Result<ResolveReport> {
-    let pending = load_pending(store.conn())?;
+    store.with_transaction(|conn| resolve_pending(conn, Unknown::Discard))
+}
+
+/// 解析目前所有待處理的引用。
+///
+/// 交易邊界由呼叫端決定：增量同步要把刪除、寫入與解析放進同一個交易，
+/// 中途失敗才不會留下半張圖。
+pub fn resolve_pending(conn: &Connection, unknown: Unknown) -> Result<ResolveReport> {
+    let pending = load_pending(conn)?;
     let mut report = ResolveReport::default();
 
-    store.with_transaction(|conn| {
-        for row in &pending {
-            let rel = Rel::from_u8(row.rel as u8).unwrap_or(Rel::Calls);
-            match names::resolve(conn, &row.ref_name, row.file_id, rel)? {
-                names::Match::One(target, provenance) => {
-                    write_edge(conn, row, target, provenance)?;
-                    discard(conn, row.id)?;
-                    report.resolved += 1;
-                    if provenance == Provenance::Heuristic {
-                        report.guessed += 1;
-                    }
-                }
-                names::Match::Ambiguous => {
-                    mark_failed(conn, row)?;
-                    report.ambiguous += 1;
-                }
-                names::Match::None => {
-                    discard(conn, row.id)?;
-                    report.external += 1;
+    for row in &pending {
+        let rel = Rel::from_u8(row.rel as u8).unwrap_or(Rel::Calls);
+        match names::resolve(conn, &row.ref_name, row.file_id, rel)? {
+            names::Match::One(target, provenance) => {
+                write_edge(conn, row, target, provenance)?;
+                discard(conn, row.id)?;
+                report.resolved += 1;
+                if provenance == Provenance::Heuristic {
+                    report.guessed += 1;
                 }
             }
+            names::Match::Ambiguous => {
+                mark(conn, row, STATUS_FAILED)?;
+                report.ambiguous += 1;
+            }
+            names::Match::None => {
+                match unknown {
+                    Unknown::Discard => discard(conn, row.id)?,
+                    Unknown::Keep => mark(conn, row, STATUS_EXTERNAL)?,
+                }
+                report.external += 1;
+            }
         }
-        Ok(())
-    })?;
+    }
 
     Ok(report)
+}
+
+/// 把名字對得上的失敗引用改回待解析。
+///
+/// 先寫呼叫端、後寫被呼叫端是常見的編輯順序。第一次存檔時目標還不
+/// 存在，引用只能標成失敗；目標寫進來之後要靠這裡把它撿回來，否則那
+/// 條邊要等到下次全量索引才會出現。
+pub fn requeue_by_names(conn: &Connection, names: &[String]) -> Result<usize> {
+    let mut stmt = conn.prepare_cached(
+        "UPDATE unresolved_refs SET status = ?1
+         WHERE status IN (?2, ?3) AND name_tail = ?4",
+    )?;
+
+    let mut requeued = 0;
+    for name in names {
+        requeued += stmt.execute(rusqlite::params![
+            STATUS_PENDING,
+            STATUS_FAILED,
+            STATUS_EXTERNAL,
+            name
+        ])?;
+    }
+    Ok(requeued)
 }
 
 /// 一筆待解析的引用。
@@ -137,10 +181,11 @@ fn discard(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-fn mark_failed(conn: &Connection, row: &Pending) -> Result<()> {
+/// 把引用留在佇列裡並記下狀態與名字尾段，之後才查得回來。
+fn mark(conn: &Connection, row: &Pending, status: i64) -> Result<()> {
     conn.execute(
         "UPDATE unresolved_refs SET status = ?1, name_tail = ?2 WHERE id = ?3",
-        rusqlite::params![STATUS_FAILED, names::tail(&row.ref_name), row.id],
+        rusqlite::params![status, names::tail(&row.ref_name), row.id],
     )?;
     Ok(())
 }
@@ -269,6 +314,72 @@ mod tests {
 
         resolve_all(&mut store).unwrap();
         assert_eq!(store.stats().unwrap().relations, 2);
+    }
+
+    /// 全量索引結束時所有符號都已寫入，查不到就是專案外部的東西。
+    #[test]
+    fn a_full_index_discards_names_it_cannot_find() {
+        let mut store = indexed(&[("src/a.rs", "fn caller(v: Vec<u8>) {\n    v.len();\n}\n")]);
+
+        resolve_all(&mut store).unwrap();
+        let rows: i64 = store
+            .conn()
+            .query_row("SELECT count(*) FROM unresolved_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    /// 增量同步只寫了一個檔案，查不到的名字可能只是還沒輪到它。
+    #[test]
+    fn an_incremental_pass_keeps_names_it_cannot_find() {
+        let mut store = indexed(&[("src/a.rs", "fn caller() {\n    not_yet();\n}\n")]);
+
+        let report = store
+            .with_transaction(|conn| resolve_pending(conn, Unknown::Keep))
+            .unwrap();
+        assert_eq!(report.external, 1);
+
+        let (rows, tail): (i64, String) = store
+            .conn()
+            .query_row(
+                "SELECT count(*), max(name_tail) FROM unresolved_refs WHERE status = 2",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(tail, "not_yet", "沒有記下名字尾段就查不回來");
+    }
+
+    /// 重試靠名字的最後一段反查，兩種保留下來的狀態都要撿得回來。
+    #[test]
+    fn requeueing_covers_both_kinds_of_kept_reference() {
+        let mut store = indexed(&[("src/a.rs", "fn caller() {\n    missing();\n}\n")]);
+        store
+            .with_transaction(|conn| resolve_pending(conn, Unknown::Keep))
+            .unwrap();
+
+        let requeued = requeue_by_names(store.conn(), &["missing".to_string()]).unwrap();
+        assert_eq!(requeued, 1);
+
+        let pending: i64 = store
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM unresolved_refs WHERE status = 0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1);
+    }
+
+    #[test]
+    fn requeueing_a_name_nobody_waits_for_changes_nothing() {
+        let store = indexed(&[("src/a.rs", "fn one() {}\n")]);
+        assert_eq!(
+            requeue_by_names(store.conn(), &["unrelated".to_string()]).unwrap(),
+            0
+        );
     }
 
     #[test]

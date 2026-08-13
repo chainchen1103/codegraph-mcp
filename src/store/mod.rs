@@ -17,7 +17,7 @@ use crate::error::Result;
 pub const SCHEMA: &str = include_str!("schema.sql");
 
 /// 目前的 schema 版本。修改 `schema.sql` 時必須同步遞增並提供 migration。
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 資料庫頁大小。必須在資料庫產生任何頁面之前設定，之後設定無效。
 const PAGE_SIZE: i64 = 4096;
@@ -74,8 +74,20 @@ impl Store {
             files: self.count("files")?,
             symbols: self.count("symbols")?,
             relations: self.count("relations")?,
-            pending_refs: self.count("unresolved_refs")?,
+            pending_refs: self.count_pending_refs()?,
         })
+    }
+
+    /// 還有機會解析出來的引用數。
+    ///
+    /// 增量同步會把索引裡查無此名的引用留在佇列裡，等新符號出現時重試。
+    /// 那些是專案外部的呼叫，不屬於「圖還缺這一塊」，不列入計數。
+    fn count_pending_refs(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM unresolved_refs WHERE status != 2",
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// 計算單一表的列數。`table` 僅接受本模組內的字面值。
@@ -145,6 +157,13 @@ fn configure(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 檔案內容的雜湊，對應 `files.content_hash`。
+///
+/// 增量同步靠它判斷一個檔案要不要重新解析。
+pub fn content_hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex()[..32].to_string()
+}
+
 /// 目前時間，Unix epoch 毫秒。
 pub(crate) fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -195,6 +214,27 @@ mod tests {
             }
         );
         assert!(!stats.is_empty());
+    }
+
+    /// 專案外部的呼叫留在佇列裡是為了日後重試，不代表圖還缺這一塊。
+    #[test]
+    fn retained_external_refs_are_not_counted_as_pending() {
+        let store = Store::in_memory().unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO units(id, name) VALUES (1, 'root');
+                 INSERT INTO files(id, path, unit_id, content_hash, indexed_at)
+                     VALUES (1, 'a.rs', 1, 'h', 0);
+                 INSERT INTO symbols(id, name, kind, file_id, start_line, end_line)
+                     VALUES (1, 'f', 1, 1, 1, 2);
+                 INSERT INTO unresolved_refs(from_id, ref_name, rel, file_id, line, status)
+                     VALUES (1, 'ambiguous', 1, 1, 2, 1),
+                            (1, 'std_call', 1, 1, 3, 2);",
+            )
+            .unwrap();
+
+        assert_eq!(store.stats().unwrap().pending_refs, 1);
     }
 
     #[test]
@@ -270,6 +310,13 @@ mod tests {
 
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn content_hashes_differ_for_different_content() {
+        assert_eq!(content_hash(b"same"), content_hash(b"same"));
+        assert_ne!(content_hash(b"one"), content_hash(b"two"));
+        assert_eq!(content_hash(b"x").len(), 32);
     }
 
     #[test]

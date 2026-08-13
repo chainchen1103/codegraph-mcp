@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use rusqlite::Connection;
 
-use super::intern::Interner;
+use super::intern::{Interned, Interner};
 use super::now_millis;
 use crate::error::Result;
 use crate::extract::FileParse;
@@ -33,6 +33,9 @@ pub struct Writer {
     paths: Interner,
     units: Interner,
     handles: HashSet<String>,
+    /// 接在既有索引之後寫入。字串池此時是冷的，查不到的字串要先問過
+    /// 資料庫才知道是新的還是既有的。
+    resumed: bool,
 }
 
 impl Writer {
@@ -42,7 +45,23 @@ impl Writer {
             paths: Interner::new(),
             units: Interner::new(),
             handles: HashSet::new(),
+            resumed: false,
         }
+    }
+
+    /// 接在既有索引之後繼續寫入。
+    ///
+    /// 全量索引從空的資料庫開始，字串池就是全部的事實；增量寫入只碰
+    /// 一個檔案，其餘的對應仍留在資料庫裡，因此識別碼要續號，而每次
+    /// intern 都要先查一次資料庫。
+    pub fn resume(conn: &Connection) -> Result<Self> {
+        Ok(Self {
+            monikers: Interner::continuing_from(highest_id(conn, "monikers")?),
+            paths: Interner::continuing_from(highest_id(conn, "files")?),
+            units: Interner::continuing_from(highest_id(conn, "units")?),
+            handles: HashSet::new(),
+            resumed: true,
+        })
     }
 
     /// 清空既有的索引內容，保留 schema 與版本資訊。
@@ -63,7 +82,7 @@ impl Writer {
 
     /// 取得編譯單元的識別碼，必要時建立。
     pub fn unit(&mut self, conn: &Connection, name: &str) -> Result<u32> {
-        let unit = self.units.intern(name);
+        let unit = self.lookup(conn, Pool::Units, name)?;
         if unit.is_new {
             conn.execute(
                 "INSERT OR IGNORE INTO units(id, name) VALUES (?1, ?2)",
@@ -86,7 +105,7 @@ impl Writer {
         content_hash: &str,
         parse: &FileParse,
     ) -> Result<FileWritten> {
-        let file_id = self.paths.intern(rel_path).id;
+        let file_id = self.lookup(conn, Pool::Paths, rel_path)?.id;
 
         conn.execute(
             "INSERT OR REPLACE INTO files(id, path, unit_id, is_test, is_generated, content_hash, module_path, indexed_at)
@@ -104,9 +123,9 @@ impl Writer {
 
         let mut ids = Vec::with_capacity(parse.symbols.len());
         for symbol in &parse.symbols {
-            let interned = self.monikers.intern(&symbol.moniker);
+            let interned = self.lookup(conn, Pool::Monikers, &symbol.moniker)?;
             if interned.is_new {
-                let handle = self.handle_for(&symbol.moniker);
+                let handle = self.handle_for(conn, &symbol.moniker)?;
                 conn.execute(
                     "INSERT INTO monikers(id, moniker, handle) VALUES (?1, ?2, ?3)",
                     rusqlite::params![interned.id, symbol.moniker, handle],
@@ -172,22 +191,98 @@ impl Writer {
         Ok(written)
     }
 
+    /// 取得字串的識別碼，必要時配發新的。
+    ///
+    /// 續寫既有索引時，字串池查不到不代表字串是新的——它可能只是還沒
+    /// 被載入。這種情況要先問資料庫，問不到才配發。
+    fn lookup(&mut self, conn: &Connection, pool: Pool, s: &str) -> Result<Interned> {
+        let interner = match pool {
+            Pool::Monikers => &mut self.monikers,
+            Pool::Paths => &mut self.paths,
+            Pool::Units => &mut self.units,
+        };
+
+        if let Some(id) = interner.get(s) {
+            return Ok(Interned { id, is_new: false });
+        }
+        if self.resumed
+            && let Some(id) = query_id(conn, pool.select_id(), s)?
+        {
+            interner.preload(s, id);
+            return Ok(Interned { id, is_new: false });
+        }
+        Ok(interner.intern(s))
+    }
+
     /// 配發短碼。
     ///
     /// 由雜湊前綴組成，長度不足以避免碰撞時逐級加長。相同的索引內容
     /// 會得到相同的結果，因為寫入順序是固定的。
-    fn handle_for(&mut self, moniker: &str) -> String {
+    fn handle_for(&mut self, conn: &Connection, moniker: &str) -> Result<String> {
         let hex = blake3::hash(moniker.as_bytes()).to_hex();
+
         for len in HANDLE_LENGTHS {
             let candidate = hex[..len].to_string();
-            if self.handles.insert(candidate.clone()) {
-                return candidate;
+            if !self.handles.insert(candidate.clone()) {
+                continue;
             }
+            // 續寫時本機的集合只記得這次寫過的短碼，資料庫裡的還沒載入。
+            if self.resumed
+                && query_id(
+                    conn,
+                    "SELECT id FROM monikers WHERE handle = ?1",
+                    &candidate,
+                )?
+                .is_some()
+            {
+                continue;
+            }
+            return Ok(candidate);
         }
+
         let full = hex.to_string();
         self.handles.insert(full.clone());
-        full
+        Ok(full)
     }
+}
+
+/// 三個字串池各自對應的資料表。
+#[derive(Copy, Clone, Debug)]
+enum Pool {
+    Monikers,
+    Paths,
+    Units,
+}
+
+impl Pool {
+    /// 依字串反查識別碼的語句。
+    fn select_id(self) -> &'static str {
+        match self {
+            Pool::Monikers => "SELECT id FROM monikers WHERE moniker = ?1",
+            Pool::Paths => "SELECT id FROM files WHERE path = ?1",
+            Pool::Units => "SELECT id FROM units WHERE name = ?1",
+        }
+    }
+}
+
+/// 執行一句以字串反查識別碼的語句。`sql` 僅接受本模組內的字面值。
+fn query_id(conn: &Connection, sql: &str, key: &str) -> Result<Option<u32>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let mut rows = stmt.query([key])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+/// 一張表目前最大的識別碼，空表為 0。`table` 僅接受本模組內的字面值。
+fn highest_id(conn: &Connection, table: &str) -> Result<u32> {
+    let highest: i64 = conn.query_row(
+        &format!("SELECT IFNULL(max(id), 0) FROM {table}"),
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(highest as u32)
 }
 
 /// 重建全文檢索索引。
@@ -321,17 +416,71 @@ mod tests {
 
     #[test]
     fn handles_stay_unique_even_when_prefixes_collide() {
+        let store = Store::in_memory().unwrap();
         let mut writer = Writer::new();
-        let first = writer.handle_for("src/a.rs:function:one:1");
+        let first = writer
+            .handle_for(store.conn(), "src/a.rs:function:one:1")
+            .unwrap();
 
         // 直接把短碼佔掉，模擬前綴碰撞。
         let colliding = "src/b.rs:function:two:2";
         let hex = blake3::hash(colliding.as_bytes()).to_hex();
         writer.handles.insert(hex[..6].to_string());
 
-        let second = writer.handle_for(colliding);
+        let second = writer.handle_for(store.conn(), colliding).unwrap();
         assert_ne!(first, second);
         assert_eq!(second.len(), 8, "碰撞時短碼應該加長");
+    }
+
+    /// 續寫時本機的短碼集合是空的，碰撞只能靠資料庫查出來。
+    #[test]
+    fn a_resumed_writer_avoids_handles_already_in_the_database() {
+        let store = Store::in_memory().unwrap();
+        let moniker = "src/a.rs:function:one:1";
+        let taken = blake3::hash(moniker.as_bytes()).to_hex()[..6].to_string();
+
+        store
+            .conn()
+            .execute(
+                "INSERT INTO monikers(id, moniker, handle) VALUES (1, 'other', ?1)",
+                [&taken],
+            )
+            .unwrap();
+
+        let mut writer = Writer::resume(store.conn()).unwrap();
+        let handle = writer.handle_for(store.conn(), moniker).unwrap();
+
+        assert_ne!(handle, taken, "配了一個已經被別人用掉的短碼");
+        assert_eq!(handle.len(), 8, "碰撞時短碼應該加長");
+    }
+
+    /// 續寫的識別碼從資料庫目前的最大值續號。
+    #[test]
+    fn a_resumed_writer_allocates_past_the_existing_ids() {
+        let store = Store::in_memory().unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "INSERT INTO monikers(id, moniker, handle) VALUES (7, 'existing', 'aaaaaa');
+                 INSERT INTO units(id, name) VALUES (3, 'root');",
+            )
+            .unwrap();
+
+        let mut writer = Writer::resume(store.conn()).unwrap();
+        assert_eq!(
+            writer.unit(store.conn(), "root").unwrap(),
+            3,
+            "既有的單元被當成新的了"
+        );
+        assert_eq!(
+            writer
+                .lookup(store.conn(), Pool::Monikers, "fresh")
+                .unwrap(),
+            Interned {
+                id: 8,
+                is_new: true
+            }
+        );
     }
 
     #[test]

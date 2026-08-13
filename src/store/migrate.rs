@@ -112,6 +112,9 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<()> {
             2 => conn.execute_batch(
                 "ALTER TABLE files ADD COLUMN module_path TEXT NOT NULL DEFAULT '';",
             )?,
+            // 3 到 4：待重試的引用多了一種狀態，部分索引的條件跟著放寬。
+            // 條件變了就是另一個索引，必須先卸下舊的。
+            3 => conn.execute_batch("DROP INDEX IF EXISTS idx_unresolved_tail;")?,
             other => {
                 return Err(CgError::Corrupt {
                     detail: format!("沒有從版本 {other} 升級的路徑"),
@@ -268,6 +271,31 @@ mod tests {
         migrate(&conn).unwrap();
         migrate(&conn).unwrap();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// 部分索引換了條件就是另一個索引，舊的必須先卸下才建得起來。
+    #[test]
+    fn upgrading_from_v3_widens_the_retry_index() {
+        let conn = mem();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(
+            "DROP INDEX IF EXISTS idx_unresolved_tail;
+             CREATE INDEX idx_unresolved_tail ON unresolved_refs(name_tail) WHERE status = 1;
+             INSERT INTO schema_versions(version, applied_at, note) VALUES (3, 0, 'v3');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+
+        let condition: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'idx_unresolved_tail'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(condition.contains("status > 0"), "{condition}");
     }
 
     /// 指向別的工具的資料庫時必須拒絕，而不是把索引用的表加進去。

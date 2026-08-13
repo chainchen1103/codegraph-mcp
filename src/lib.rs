@@ -13,6 +13,7 @@ pub mod model;
 pub mod project;
 pub mod resolve;
 pub mod store;
+pub mod sync;
 
 #[cfg(test)]
 mod testing;

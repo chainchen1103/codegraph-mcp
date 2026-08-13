@@ -31,6 +31,15 @@ enum Command {
         /// 專案根目錄，預設從工作目錄往上尋找
         path: Option<PathBuf>,
     },
+    /// 增量更新索引，只重新解析變更過的檔案
+    Sync {
+        /// 專案根目錄，預設從工作目錄往上尋找
+        path: Option<PathBuf>,
+
+        /// 常駐監看，存檔後自動更新
+        #[arg(long)]
+        watch: bool,
+    },
     /// 顯示索引狀態
     Status {
         /// 專案根目錄，預設從工作目錄往上尋找
@@ -85,6 +94,9 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Outline { file } => cli::outline::run(&file)?,
         Command::Index { path } => cli::index::run(path.as_deref())?,
+        Command::Sync { path, watch } => {
+            cli::sync::run(path.as_deref(), watch, |text| print!("{text}"))?
+        }
     };
 
     print!("{report}");

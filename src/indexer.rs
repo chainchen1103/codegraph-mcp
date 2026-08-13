@@ -6,8 +6,8 @@ use crate::error::Result;
 use crate::extract;
 use crate::project::{self, Project, walk};
 use crate::resolve::{self, ResolveReport};
-use crate::store::Store;
 use crate::store::write::{Writer, rebuild_fts};
+use crate::store::{Store, content_hash};
 
 /// 一次交易涵蓋的檔案數。
 ///
@@ -107,11 +107,6 @@ pub fn index_project(project: &Project, store: &mut Store) -> Result<IndexReport
 
     report.elapsed = started.elapsed();
     Ok(report)
-}
-
-/// 檔案內容的雜湊，用於之後跳過未變更的檔案。
-fn content_hash(bytes: &[u8]) -> String {
-    blake3::hash(bytes).to_hex()[..32].to_string()
 }
 
 #[cfg(test)]
@@ -271,12 +266,5 @@ mod tests {
 
         drop(store);
         cleanup(&p);
-    }
-
-    #[test]
-    fn content_hashes_differ_for_different_content() {
-        assert_eq!(content_hash(b"same"), content_hash(b"same"));
-        assert_ne!(content_hash(b"one"), content_hash(b"two"));
-        assert_eq!(content_hash(b"x").len(), 32);
     }
 }
