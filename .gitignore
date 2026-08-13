@@ -9,6 +9,9 @@
 .claude/
 .codegraph/
 codegraph/
+.mcp.json
+*.md
+!README.md
 
 # ==========================================
 # 3. Database & SQLite Transactions

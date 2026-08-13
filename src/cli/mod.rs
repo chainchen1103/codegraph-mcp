@@ -7,6 +7,7 @@ pub mod explore;
 pub mod index;
 pub mod init;
 pub mod outline;
+pub mod serve;
 pub mod status;
 pub mod sync;
 

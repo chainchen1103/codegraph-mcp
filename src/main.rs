@@ -72,6 +72,12 @@ enum Command {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    /// 以 stdio 提供 MCP 服務
+    Serve {
+        /// 只印出 MCP 設定片段，不啟動服務
+        #[arg(long)]
+        print_config: bool,
+    },
     /// 印出單一檔案的結構骨架
     Outline {
         /// 要分析的原始碼檔案
@@ -94,6 +100,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Outline { file } => cli::outline::run(&file)?,
         Command::Index { path } => cli::index::run(path.as_deref())?,
+        Command::Serve { print_config } => cli::serve::run(print_config)?,
         Command::Sync { path, watch } => {
             cli::sync::run(path.as_deref(), watch, |text| print!("{text}"))?
         }

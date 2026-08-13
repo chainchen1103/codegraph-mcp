@@ -1,6 +1,7 @@
 //! 查詢入口：輸入名字或問題，取得相關符號的逐字原始碼。
 
 pub mod budget;
+pub mod node;
 pub mod query;
 pub mod render;
 pub mod select;

@@ -9,6 +9,7 @@ pub mod explore;
 pub mod extract;
 pub mod graph;
 pub mod indexer;
+pub mod mcp;
 pub mod model;
 pub mod project;
 pub mod resolve;
