@@ -245,3 +245,63 @@ fn edits_made_after_indexing_show_up_immediately() {
     let out = f.ask("src/util.rs");
     assert!(out.text.contains("123"), "{}", out.text);
 }
+
+/// 「X 怎麼走到 Y」要在一次查詢裡回答完：路徑、每一跳的位置，以及
+/// 路徑上每個符號的原始碼。
+#[test]
+fn asking_how_one_symbol_reaches_another_answers_in_one_call() {
+    let f = Fixture::indexed(
+        "explore-flow",
+        &[
+            (
+                "src/cli.rs",
+                "use crate::indexer;\n\
+                 pub fn run() {\n    indexer::index_project();\n}\n",
+            ),
+            (
+                "src/indexer.rs",
+                "use crate::store;\n\
+                 pub fn index_project() {\n    store::write_file();\n}\n",
+            ),
+            ("src/store.rs", "pub fn write_file() {}\n"),
+        ],
+    );
+
+    let out = f.ask("run write_file");
+
+    let hops: Vec<&str> = out.selection.flows[0]
+        .hops
+        .iter()
+        .map(|h| h.qualified.as_str())
+        .collect();
+    assert_eq!(
+        hops,
+        vec!["run", "index_project", "write_file"],
+        "{}",
+        out.text
+    );
+
+    // 路徑排在原始碼前面，每一跳帶著呼叫點。
+    let flow_at = out.text.find("## Flow").expect(&out.text);
+    assert!(
+        flow_at < out.text.find("## Source").unwrap(),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("src/cli.rs:3"), "{}", out.text);
+    assert!(out.text.contains("src/indexer.rs:3"), "{}", out.text);
+
+    // 沒有被指名的中間那一站，原始碼也要一起回來。
+    assert!(out.text.contains("pub fn index_project()"), "{}", out.text);
+}
+
+/// 連不起來的兩個符號不編造路徑，但兩邊的原始碼照樣回。
+#[test]
+fn unrelated_symbols_get_source_without_an_invented_path() {
+    let f = fixture("noflow");
+    let out = f.ask("Store::close helper");
+
+    assert!(out.selection.flows.is_empty());
+    assert!(!out.text.contains("## Flow"), "{}", out.text);
+    assert!(out.text.contains("pub fn helper"), "{}", out.text);
+}

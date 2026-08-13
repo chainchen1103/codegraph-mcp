@@ -1,5 +1,7 @@
 //! 圖的查詢。
 
+pub mod path;
+
 use rusqlite::Connection;
 
 use crate::error::Result;

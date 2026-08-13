@@ -4,6 +4,7 @@ use rusqlite::Connection;
 
 use super::query::Query;
 use crate::error::Result;
+use crate::graph::path::{self, Path as CallPath};
 use crate::model::{Kind, SymbolId};
 
 /// 全文檢索最多回傳的符號數。
@@ -12,11 +13,20 @@ const TEXT_SEARCH_LIMIT: usize = 20;
 /// 查無結果時建議的候選數。
 const SUGGESTION_LIMIT: usize = 8;
 
-/// 符號被選中的原因。決定輸出額度的分配順序。
+/// 最多回報的呼叫路徑數。
+const PATH_LIMIT: usize = 4;
+
+/// 單一查詢名最多拿幾個符號去試路徑。
 ///
-/// 之後加入呼叫路徑時，路徑上的符號會排在最前面。
+/// 名字有大量同名定義時，兩兩配對的次數會平方成長。路徑的價值在指名的
+/// 那幾個符號之間，多試沒有回報。
+const ENDPOINTS_PER_NAME: usize = 4;
+
+/// 符號被選中的原因。決定輸出額度的分配順序。
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Origin {
+    /// 位於某條呼叫路徑上。
+    Flow,
     /// 使用者直接指名的符號。
     Named,
     /// 使用者指定的檔案裡的符號。
@@ -44,6 +54,8 @@ pub struct Hit {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
     pub hits: Vec<Hit>,
+    /// 被指名的符號之間的呼叫路徑。
+    pub flows: Vec<CallPath>,
     /// 查無結果的詞。
     pub unmatched: Vec<String>,
     /// 給查無結果的詞的候選名稱。
@@ -56,15 +68,28 @@ pub struct Selection {
 /// 全部符合的符號，同名的多個定義不會被截掉。
 pub fn select(conn: &Connection, query: &Query) -> Result<Selection> {
     let mut selection = Selection::default();
+    // 每個查詢名各自的命中，用來配對呼叫路徑的兩端。
+    let mut endpoints: Vec<Vec<SymbolId>> = Vec::new();
 
     for name in &query.names {
         let hits = by_name(conn, name, Origin::Named)?;
         if hits.is_empty() {
             selection.unmatched.push(name.clone());
         } else {
+            endpoints.push(hits.iter().take(ENDPOINTS_PER_NAME).map(|h| h.id).collect());
             selection.hits.extend(hits);
         }
     }
+
+    selection.flows = flows(conn, &endpoints)?;
+    let on_flows: Vec<SymbolId> = selection
+        .flows
+        .iter()
+        .flat_map(|p| p.hops.iter().map(|h| h.id))
+        .collect();
+    selection
+        .hits
+        .extend(by_ids(conn, &on_flows, Origin::Flow)?);
 
     for path in &query.paths {
         let hits = by_path(conn, path, Origin::Path)?;
@@ -137,6 +162,55 @@ fn by_path(conn: &Connection, path: &str, origin: Origin) -> Result<Vec<Hit>> {
         }
     }
     Ok(Vec::new())
+}
+
+/// 依識別碼取出符號。
+fn by_ids(conn: &Connection, ids: &[SymbolId], origin: Origin) -> Result<Vec<Hit>> {
+    let sql = symbol_query("s.id = ?1");
+    let mut out = Vec::new();
+
+    for id in ids {
+        out.extend(collect(conn, &sql, rusqlite::params![id.0], origin)?);
+    }
+    Ok(out)
+}
+
+/// 找出被指名的符號之間的呼叫路徑。
+///
+/// 只配對來自不同查詢名的兩端：同一個名字的多個定義之間即使連得起來，
+/// 也不是使用者問的那條路徑。
+fn flows(conn: &Connection, endpoints: &[Vec<SymbolId>]) -> Result<Vec<CallPath>> {
+    let mut out = Vec::new();
+
+    for (index, left) in endpoints.iter().enumerate() {
+        for right in endpoints.iter().skip(index + 1) {
+            if out.len() >= PATH_LIMIT {
+                return Ok(out);
+            }
+            if let Some(found) = between(conn, left, right)? {
+                out.push(found);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// 兩組符號之間的第一條路徑。
+///
+/// 兩個方向都試：使用者打兩個名字時不會特意按呼叫方向排列。
+fn between(conn: &Connection, left: &[SymbolId], right: &[SymbolId]) -> Result<Option<CallPath>> {
+    for a in left {
+        for b in right {
+            if let Some(found) = path::shortest(conn, *a, *b)? {
+                return Ok(Some(found));
+            }
+            if let Some(found) = path::shortest(conn, *b, *a)? {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// 取出組成 [`Hit`] 所需欄位的查詢，條件由呼叫端給。
@@ -433,5 +507,108 @@ impl Store {
         assert_eq!(shared_prefix("abcdef"), "abcd");
         assert_ne!(shared_prefix("ab"), "a");
         assert_ne!(shared_prefix("x"), "");
+    }
+
+    /// 中間隔了一層的兩個符號，路徑要把中間那一層帶出來。
+    #[test]
+    fn two_named_symbols_get_the_call_path_between_them() {
+        let store = crate::testing::resolved(&[(
+            "src/a.rs",
+            "pub fn sink() {}\n\
+             pub fn middle() {\n    sink();\n}\n\
+             pub fn entry() {\n    middle();\n}\n",
+        )]);
+        let selection = run(&store, "entry sink");
+
+        assert_eq!(selection.flows.len(), 1);
+        let hops: Vec<&str> = selection.flows[0]
+            .hops
+            .iter()
+            .map(|h| h.qualified.as_str())
+            .collect();
+        assert_eq!(hops, vec!["entry", "middle", "sink"]);
+    }
+
+    /// 橋接節點沒有被指名，但它的原始碼是看懂這條路徑的必要條件。
+    #[test]
+    fn symbols_on_a_path_are_selected_even_though_nobody_named_them() {
+        let store = crate::testing::resolved(&[(
+            "src/a.rs",
+            "pub fn sink() {}\n\
+             pub fn middle() {\n    sink();\n}\n\
+             pub fn entry() {\n    middle();\n}\n",
+        )]);
+        let selection = run(&store, "entry sink");
+
+        let bridge = selection
+            .hits
+            .iter()
+            .find(|h| h.qualified == "middle")
+            .expect("橋接節點沒有進到結果裡");
+        assert_eq!(bridge.origin, Origin::Flow);
+    }
+
+    /// 路徑上的符號優先度最高，即使它同時是被指名的那一個。
+    #[test]
+    fn being_on_a_path_outranks_being_named() {
+        let store = crate::testing::resolved(&[(
+            "src/a.rs",
+            "pub fn sink() {}\npub fn entry() {\n    sink();\n}\n",
+        )]);
+        let selection = run(&store, "entry sink");
+
+        assert!(selection.hits.iter().all(|h| h.origin == Origin::Flow));
+    }
+
+    /// 使用者不會特意按呼叫方向排列兩個名字。
+    #[test]
+    fn the_two_names_can_be_given_in_either_order() {
+        let store = crate::testing::resolved(&[(
+            "src/a.rs",
+            "pub fn sink() {}\npub fn entry() {\n    sink();\n}\n",
+        )]);
+
+        assert_eq!(
+            run(&store, "sink entry").flows,
+            run(&store, "entry sink").flows
+        );
+    }
+
+    #[test]
+    fn a_single_name_never_produces_a_path() {
+        let store = sample_store();
+        assert!(run(&store, "Store::open").flows.is_empty());
+    }
+
+    #[test]
+    fn unrelated_names_produce_no_path() {
+        let store = crate::testing::resolved(&[("src/a.rs", "pub fn one() {}\npub fn two() {}\n")]);
+        assert!(run(&store, "one two").flows.is_empty());
+    }
+
+    /// 檔案路徑與自然語言不是路徑的端點，只有指名的符號是。
+    #[test]
+    fn only_named_symbols_are_used_as_endpoints() {
+        let store = crate::testing::resolved(&[(
+            "src/a.rs",
+            "pub fn sink() {}\npub fn entry() {\n    sink();\n}\n",
+        )]);
+        assert!(run(&store, "src/a.rs sink").flows.is_empty());
+    }
+
+    /// 指名的符號一多，兩兩配對的路徑數會失控，只回報前幾條。
+    #[test]
+    fn the_number_of_reported_paths_is_capped() {
+        let mut source = String::new();
+        for i in 0..6 {
+            match i {
+                5 => source.push_str("pub fn f5() {}\n"),
+                _ => source.push_str(&format!("pub fn f{i}() {{\n    f{}();\n}}\n", i + 1)),
+            }
+        }
+        let store = crate::testing::resolved(&[("src/a.rs", &source)]);
+
+        let selection = run(&store, "f0 f1 f2 f3 f4 f5");
+        assert_eq!(selection.flows.len(), PATH_LIMIT);
     }
 }

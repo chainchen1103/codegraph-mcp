@@ -6,6 +6,8 @@ use std::path::Path;
 
 use super::budget::{Budget, MIN_USEFUL_CHARS};
 use super::select::{Hit, Selection};
+use crate::graph::path::Path as CallPath;
+use crate::model::Provenance;
 
 /// 讀不到原始碼時顯示的說明。
 const FALLBACK_NOTE: &str = "（讀不到原始碼，以下僅有簽名）";
@@ -31,6 +33,7 @@ pub fn render(root: &Path, selection: &Selection, budget: Budget) -> String {
     }
 
     let mut out = String::new();
+    render_flow(&mut out, &selection.flows);
     writeln!(out, "## Source").ok();
 
     let mut current_file: Option<&str> = None;
@@ -59,6 +62,50 @@ pub fn render(root: &Path, selection: &Selection, budget: Budget) -> String {
     }
 
     out
+}
+
+/// 排版呼叫路徑。
+///
+/// 每一跳的位置是它呼叫下一跳的地方，因此順著讀下來就是一串呼叫點；
+/// 最後一跳沒有下一跳，只列出它所在的檔案。
+fn render_flow(out: &mut String, flows: &[CallPath]) {
+    if flows.is_empty() {
+        return;
+    }
+
+    writeln!(out, "## Flow").ok();
+
+    for path in flows {
+        writeln!(out).ok();
+        let width = path
+            .hops
+            .iter()
+            .map(|h| h.qualified.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(48);
+
+        for hop in &path.hops {
+            let site = match hop.line {
+                Some(line) => format!("{}:{line}", hop.file),
+                None => hop.file.clone(),
+            };
+            // 合成的邊要標出來，呼叫端才判斷得了這一跳可不可信。
+            let note = match hop.provenance {
+                Provenance::Heuristic => "  [heuristic]",
+                Provenance::Static => "",
+            };
+            writeln!(
+                out,
+                "  {:<width$}  {site}{note}",
+                hop.qualified,
+                width = width
+            )
+            .ok();
+        }
+    }
+
+    writeln!(out).ok();
 }
 
 /// 依預算決定每個符號能拿到多少輸出。
@@ -221,6 +268,7 @@ mod tests {
     use super::*;
     use crate::explore::budget;
     use crate::explore::select::Origin;
+    use crate::graph::path::Hop;
     use crate::model::{Kind, SymbolId};
 
     /// 一個帶 `src/` 的暫存目錄，測試在裡面放要被讀取的原始碼。
@@ -327,6 +375,7 @@ mod tests {
 
         let selection = Selection {
             hits: vec![hit("src/a.rs", 1, 1, "one")],
+            flows: Vec::new(),
             unmatched: vec!["missing".into()],
             suggestions: vec![],
         };
@@ -343,6 +392,7 @@ mod tests {
         let root = tmpdir("suggest");
         let selection = Selection {
             hits: vec![],
+            flows: Vec::new(),
             unmatched: vec!["opne".into()],
             suggestions: vec!["Store::open".into(), "open".into()],
         };
@@ -360,6 +410,7 @@ mod tests {
         let root = tmpdir("noidea");
         let selection = Selection {
             hits: vec![],
+            flows: Vec::new(),
             unmatched: vec!["zzz".into()],
             suggestions: vec![],
         };
@@ -466,6 +517,7 @@ mod tests {
             },
             Selection {
                 hits: vec![],
+                flows: Vec::new(),
                 unmatched: vec!["zzz".into()],
                 suggestions: vec![],
             },
@@ -501,5 +553,120 @@ mod tests {
         assert!(pos_one < pos_two, "輸出沒有依行號排序：{out}");
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn hop(qualified: &str, file: &str, line: Option<u32>, provenance: Provenance) -> Hop {
+        Hop {
+            id: SymbolId(1),
+            qualified: qualified.to_string(),
+            kind: Kind::Function,
+            file: file.to_string(),
+            line,
+            provenance,
+        }
+    }
+
+    fn flow(hops: Vec<Hop>) -> CallPath {
+        CallPath { hops }
+    }
+
+    /// 路徑排在原始碼前面：先知道怎麼走到，再看每一站的內容。
+    #[test]
+    fn the_flow_section_comes_before_the_source() {
+        let root = tmpdir("flow");
+        std::fs::write(root.join("src/a.rs"), "fn one() {}\n").unwrap();
+
+        let selection = Selection {
+            hits: vec![hit("src/a.rs", 1, 1, "one")],
+            flows: vec![flow(vec![
+                hop("entry", "src/a.rs", Some(7), Provenance::Static),
+                hop("one", "src/a.rs", None, Provenance::Static),
+            ])],
+            ..Default::default()
+        };
+        let out = render(&root, &selection, generous());
+
+        let flow_at = out.find("## Flow").expect("沒有 Flow 區塊");
+        let source_at = out.find("## Source").unwrap();
+        assert!(flow_at < source_at, "Flow 排在 Source 後面：{out}");
+        assert!(out.contains("entry"), "{out}");
+    }
+
+    /// 每一跳帶的是它呼叫下一跳的位置，終點沒有下一跳因此只列檔案。
+    #[test]
+    fn every_hop_carries_a_location() {
+        let root = tmpdir("flowsites");
+        std::fs::write(root.join("src/a.rs"), "fn one() {}\n").unwrap();
+
+        let selection = Selection {
+            hits: vec![hit("src/a.rs", 1, 1, "one")],
+            flows: vec![flow(vec![
+                hop("entry", "src/cli.rs", Some(7), Provenance::Static),
+                hop("middle", "src/mid.rs", Some(21), Provenance::Static),
+                hop("one", "src/a.rs", None, Provenance::Static),
+            ])],
+            ..Default::default()
+        };
+        let out = render(&root, &selection, generous());
+
+        assert!(out.contains("src/cli.rs:7"), "{out}");
+        assert!(out.contains("src/mid.rs:21"), "{out}");
+        assert!(
+            !out.contains("src/a.rs:0"),
+            "沒有位置時不該編一個出來：{out}"
+        );
+    }
+
+    /// 合成的跳點要攤開標示，呼叫端才判斷得了這一跳可不可信。
+    #[test]
+    fn a_synthesised_hop_is_flagged_in_the_output() {
+        let root = tmpdir("flowheuristic");
+        std::fs::write(root.join("src/a.rs"), "fn one() {}\n").unwrap();
+
+        let selection = Selection {
+            hits: vec![hit("src/a.rs", 1, 1, "one")],
+            flows: vec![flow(vec![
+                hop("entry", "src/cli.rs", Some(7), Provenance::Static),
+                hop("one", "src/a.rs", None, Provenance::Heuristic),
+            ])],
+            ..Default::default()
+        };
+        let out = render(&root, &selection, generous());
+
+        assert_eq!(out.matches("[heuristic]").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn without_a_path_there_is_no_flow_section() {
+        let root = tmpdir("noflow");
+        std::fs::write(root.join("src/a.rs"), "fn one() {}\n").unwrap();
+
+        let selection = Selection {
+            hits: vec![hit("src/a.rs", 1, 1, "one")],
+            ..Default::default()
+        };
+        let out = render(&root, &selection, generous());
+
+        assert!(!out.contains("## Flow"), "{out}");
+    }
+
+    #[test]
+    fn several_paths_are_listed_separately() {
+        let root = tmpdir("flows");
+        std::fs::write(root.join("src/a.rs"), "fn one() {}\n").unwrap();
+
+        let path = flow(vec![
+            hop("entry", "src/cli.rs", Some(7), Provenance::Static),
+            hop("one", "src/a.rs", None, Provenance::Static),
+        ]);
+        let selection = Selection {
+            hits: vec![hit("src/a.rs", 1, 1, "one")],
+            flows: vec![path.clone(), path],
+            ..Default::default()
+        };
+        let out = render(&root, &selection, generous());
+
+        assert_eq!(out.matches("entry").count(), 2, "{out}");
+        assert_eq!(out.matches("## Flow").count(), 1, "{out}");
     }
 }
