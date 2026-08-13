@@ -77,9 +77,9 @@ impl Default for Server {
 impl Server {
     /// 主入口。
     #[tool(
-        description = "取回相關符號的逐字帶行號原始碼、被指名符號之間的呼叫路徑，\
-                       以及受影響範圍。輸入可以是自然語言問句，或一串符號名／\
-                       限定名／檔案路徑。"
+        description = "取回相關符號的逐字帶行號原始碼，以及被指名符號之間的呼叫\
+                       路徑。輸入可以是自然語言問句，或一串符號名／限定名／\
+                       檔案路徑。"
     )]
     pub async fn explore(&self, args: Parameters<ExploreArgs>) -> CallToolResult {
         let Parameters(args) = args;

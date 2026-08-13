@@ -29,7 +29,10 @@ pub fn explore(project_path: Option<&Path>, input: &str, session: &mut Session) 
         String::new()
     } else {
         let budget = budget::for_file_count(store.stats()?.files.max(0) as usize);
-        render::render(project.root(), &selection, budget)
+        let (text, emitted) = render::reporting(project.root(), &selection, budget);
+        // 記的是實際送出去的，不是選中的：被額度裁掉的還沒到對方手上。
+        session.record(project.root(), &selection, &emitted);
+        text
     };
 
     session::render_pointers(&mut out, &pointers);

@@ -7,7 +7,7 @@ use std::path::Path;
 use super::budget::{Budget, MIN_USEFUL_CHARS};
 use super::select::{Hit, Selection};
 use crate::graph::path::Path as CallPath;
-use crate::model::Provenance;
+use crate::model::{Provenance, SymbolId};
 
 /// 讀不到原始碼時顯示的說明。
 const FALLBACK_NOTE: &str = "（讀不到原始碼，以下僅有簽名）";
@@ -21,16 +21,36 @@ struct Allocated<'a> {
     clipped: usize,
 }
 
+/// 一個確實把完整原始碼送出去的符號。
+///
+/// 只有整段都送出的才算數：讀不到原始碼、或因額度被裁掉一部分的，都不
+/// 算送過。呼叫端據此判斷下一次能不能省略，寧可重送也不能少送。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Emitted {
+    pub id: SymbolId,
+}
+
 /// 排版整份結果。
 pub fn render(root: &Path, selection: &Selection, budget: Budget) -> String {
+    reporting(root, selection, budget).0
+}
+
+/// 排版，並回報實際完整送出了哪些符號。
+pub fn reporting(root: &Path, selection: &Selection, budget: Budget) -> (String, Vec<Emitted>) {
     if selection.hits.is_empty() {
-        return not_found(selection);
+        return (not_found(selection), Vec::new());
     }
 
     let (allocated, omitted) = allocate(root, &selection.hits, budget);
     if allocated.is_empty() {
-        return not_found(selection);
+        return (not_found(selection), Vec::new());
     }
+
+    let emitted: Vec<Emitted> = allocated
+        .iter()
+        .filter(|a| !a.lines.is_empty() && a.clipped == 0)
+        .map(|a| Emitted { id: a.hit.id })
+        .collect();
 
     let mut out = String::new();
     render_flow(&mut out, &selection.flows);
@@ -61,7 +81,7 @@ pub fn render(root: &Path, selection: &Selection, budget: Budget) -> String {
         writeln!(out, "查無結果：{}", selection.unmatched.join("、")).ok();
     }
 
-    out
+    (out, emitted)
 }
 
 /// 排版呼叫路徑。
