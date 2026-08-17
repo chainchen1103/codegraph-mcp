@@ -1,5 +1,6 @@
 //! 圖的查詢。
 
+pub mod impact;
 pub mod path;
 
 use rusqlite::Connection;

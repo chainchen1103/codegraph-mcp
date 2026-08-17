@@ -4,6 +4,7 @@ use rusqlite::Connection;
 
 use super::query::Query;
 use crate::error::Result;
+use crate::graph::impact::{self, Impact};
 use crate::graph::path::{self, Path as CallPath};
 use crate::model::{Kind, SymbolId};
 
@@ -21,6 +22,12 @@ const PATH_LIMIT: usize = 4;
 /// 名字有大量同名定義時，兩兩配對的次數會平方成長。路徑的價值在指名的
 /// 那幾個符號之間，多試沒有回報。
 const ENDPOINTS_PER_NAME: usize = 4;
+
+/// 最多替幾個符號算受影響範圍。
+///
+/// 一個名字對到十幾個同名符號是常態，每個都算一份會把摘要變成清單，
+/// 而摘要一旦變長就開始跟原始碼搶版面。
+const BLAST_SYMBOLS: usize = 6;
 
 /// 符號被選中的原因。決定輸出額度的分配順序。
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,12 +57,22 @@ pub struct Hit {
     pub origin: Origin,
 }
 
+/// 一個被指名符號的受影響範圍。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Blast {
+    pub qualified: String,
+    pub kind: Kind,
+    pub impact: Impact,
+}
+
 /// 一次挑選的結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
     pub hits: Vec<Hit>,
     /// 被指名的符號之間的呼叫路徑。
     pub flows: Vec<CallPath>,
+    /// 被指名的符號各自被誰依賴。
+    pub blast: Vec<Blast>,
     /// 查無結果的詞。
     pub unmatched: Vec<String>,
     /// 給查無結果的詞的候選名稱。
@@ -116,7 +133,33 @@ pub fn select(conn: &Connection, query: &Query) -> Result<Selection> {
     }
 
     dedup_and_sort(&mut selection.hits);
+    selection.blast = blast(conn, &selection.hits)?;
     Ok(selection)
+}
+
+/// 被指名符號的受影響範圍。
+///
+/// 只算使用者指名的那幾個。路徑上與全文檢索找到的符號是我們替他挑的，
+/// 替它們也算一份只會把輸出撐大，卻不是他問的問題。
+fn blast(conn: &Connection, hits: &[Hit]) -> Result<Vec<Blast>> {
+    let mut out = Vec::new();
+
+    for hit in hits.iter().filter(|h| h.origin == Origin::Named) {
+        if out.len() >= BLAST_SYMBOLS {
+            break;
+        }
+        let impact = impact::of(conn, hit.id)?;
+        if impact.is_empty() {
+            continue;
+        }
+        out.push(Blast {
+            qualified: hit.qualified.clone(),
+            kind: hit.kind,
+            impact,
+        });
+    }
+
+    Ok(out)
 }
 
 /// 依名字比對，先精確再忽略大小寫。

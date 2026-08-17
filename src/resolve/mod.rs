@@ -283,12 +283,15 @@ mod tests {
     }
 
     /// 標準函式庫的呼叫永遠解析不了，留著只會變成永久的雜訊。
+    ///
+    /// 這個 fixture 有兩個專案外部的引用：呼叫 `Vec::len`，以及參數用到
+    /// 的型別 `Vec` 本身。
     #[test]
     fn calls_to_symbols_outside_the_project_are_discarded() {
         let mut store = indexed(&[("src/a.rs", "fn caller(v: Vec<u8>) {\n    v.len();\n}\n")]);
 
         let report = resolve_all(&mut store).unwrap();
-        assert_eq!(report.external, 1);
+        assert_eq!(report.external, 2);
         assert_eq!(store.stats().unwrap().pending_refs, 0);
     }
 

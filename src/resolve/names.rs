@@ -186,6 +186,21 @@ const RECEIVER_EXCLUDES: [Kind; 6] = [
     Kind::Enum,
 ];
 
+/// 型別的位置上不可能站著的種類。
+const TYPE_EXCLUDES: [Kind; 4] = [Kind::Function, Kind::Method, Kind::Const, Kind::Module];
+
+/// `impl X for Y` 的 X 只可能是 trait，其餘全部排除。
+const IMPLEMENTS_EXCLUDES: [Kind; 8] = [
+    Kind::Function,
+    Kind::Method,
+    Kind::Const,
+    Kind::Module,
+    Kind::Struct,
+    Kind::Enum,
+    Kind::TypeAlias,
+    Kind::Class,
+];
+
 /// 比對的欄位。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Field {
@@ -303,13 +318,18 @@ fn unique_anywhere(
 ///
 /// 回傳的 SQL 片段由排除清單產生，不含任何外部輸入。
 fn kind_filter(rel: Rel, field: Field, style: Style) -> &'static str {
-    if rel != Rel::Calls {
-        return "";
-    }
-    match (field, style) {
-        (Field::Qualified, _) => base_clause(),
-        (Field::Name, Style::Direct) => direct_clause(),
-        (Field::Name, Style::Receiver) => receiver_clause(),
+    match rel {
+        Rel::Calls => match (field, style) {
+            (Field::Qualified, _) => base_clause(),
+            (Field::Name, Style::Direct) => direct_clause(),
+            (Field::Name, Style::Receiver) => receiver_clause(),
+        },
+        // 型別的位置上只可能站著型別。專案裡到處都有跟型別同名的建構
+        // 函數，不擋掉就會接到函數身上。
+        Rel::UsesType => type_clause(),
+        // `impl X for Y` 的 X 只可能是 trait。
+        Rel::Implements => trait_clause(),
+        _ => "",
     }
 }
 
@@ -331,6 +351,20 @@ fn receiver_clause() -> &'static str {
     static CLAUSE: OnceLock<String> = OnceLock::new();
     CLAUSE
         .get_or_init(|| exclude_clause(&RECEIVER_EXCLUDES))
+        .as_str()
+}
+
+fn type_clause() -> &'static str {
+    static CLAUSE: OnceLock<String> = OnceLock::new();
+    CLAUSE
+        .get_or_init(|| exclude_clause(&TYPE_EXCLUDES))
+        .as_str()
+}
+
+fn trait_clause() -> &'static str {
+    static CLAUSE: OnceLock<String> = OnceLock::new();
+    CLAUSE
+        .get_or_init(|| exclude_clause(&IMPLEMENTS_EXCLUDES))
         .as_str()
 }
 
@@ -661,14 +695,42 @@ mod tests {
         assert!(!BASE_EXCLUDES.contains(&Kind::Method));
     }
 
-    /// 只有呼叫需要依寫法排除種類，其他關係沒有這個限制。
+    /// 型別的位置上只能是型別，寫法無關。
     #[test]
-    fn other_relations_do_not_filter_by_kind() {
-        assert_eq!(kind_filter(Rel::UsesType, Field::Name, Style::Direct), "");
+    fn a_type_reference_excludes_everything_that_is_not_a_type() {
+        let clause = kind_filter(Rel::UsesType, Field::Name, Style::Direct);
         assert_eq!(
-            kind_filter(Rel::Implements, Field::Qualified, Style::Receiver),
-            ""
+            clause,
+            kind_filter(Rel::UsesType, Field::Qualified, Style::Receiver),
+            "型別引用不該因寫法而不同"
         );
+        for kind in TYPE_EXCLUDES {
+            assert!(clause.contains(&(kind as u8).to_string()), "{clause}");
+        }
+        assert!(
+            !clause.contains(&(Kind::Struct as u8).to_string()),
+            "{clause}"
+        );
+    }
+
+    /// `impl X for Y` 的 X 只可能是 trait。
+    #[test]
+    fn an_implements_reference_keeps_only_traits() {
+        let clause = kind_filter(Rel::Implements, Field::Qualified, Style::Direct);
+        assert!(
+            !clause.contains(&(Kind::Trait as u8).to_string()),
+            "{clause}"
+        );
+        for kind in IMPLEMENTS_EXCLUDES {
+            assert!(clause.contains(&(kind as u8).to_string()), "{clause}");
+        }
+    }
+
+    /// 還沒有抽取器產生的關係不加任何限制。
+    #[test]
+    fn an_unused_relation_does_not_filter_by_kind() {
+        assert_eq!(kind_filter(Rel::Extends, Field::Name, Style::Direct), "");
+        assert_eq!(kind_filter(Rel::Contains, Field::Name, Style::Direct), "");
     }
 
     #[test]

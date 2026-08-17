@@ -305,3 +305,58 @@ fn unrelated_symbols_get_source_without_an_invented_path() {
     assert!(!out.text.contains("## Flow"), "{}", out.text);
     assert!(out.text.contains("pub fn helper"), "{}", out.text);
 }
+
+/// 改一個型別會波及誰，靠呼叫關係看不出來——沒有人呼叫「型別」。
+#[test]
+fn a_type_reports_the_files_that_depend_on_it() {
+    let f = Fixture::indexed(
+        "blast",
+        &[
+            ("src/model.rs", "pub struct Widget {\n    pub id: u32,\n}\n"),
+            (
+                "src/a.rs",
+                "use crate::model::Widget;\n\
+                 pub fn one(w: &Widget) {}\n\
+                 pub fn two() -> Widget {\n    Widget { id: 0 }\n}\n",
+            ),
+            (
+                "src/b.rs",
+                "use crate::model::Widget;\npub struct Holder {\n    inner: Widget,\n}\n",
+            ),
+        ],
+    );
+
+    let out = f.ask("Widget");
+
+    // 三個引用散在兩個檔案裡，全部來自宣告而不是呼叫。
+    let blast = &out.selection.blast;
+    assert_eq!(blast.len(), 1, "{:?}", blast);
+    assert_eq!(blast[0].impact.total, 3, "{:?}", blast[0].impact);
+
+    let files: Vec<&str> = blast[0]
+        .impact
+        .files
+        .iter()
+        .map(|u| u.file.as_str())
+        .collect();
+    assert_eq!(files, ["src/a.rs", "src/b.rs"]);
+
+    // 摘要排在原始碼之後，並且指出各檔幾處。
+    assert!(out.text.contains("## Blast radius"), "{}", out.text);
+    assert!(
+        out.text.find("## Source") < out.text.find("## Blast radius"),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains("struct Widget  3 處"), "{}", out.text);
+}
+
+/// 沒有人依賴的符號不印空區塊。
+#[test]
+fn an_unused_symbol_has_no_blast_radius() {
+    let f = fixture("blast-none");
+    let out = f.ask("Store::close");
+
+    assert!(out.selection.blast.is_empty());
+    assert!(!out.text.contains("## Blast radius"), "{}", out.text);
+}

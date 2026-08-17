@@ -5,9 +5,12 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use super::budget::{Budget, MIN_USEFUL_CHARS};
-use super::select::{Hit, Selection};
+use super::select::{Blast, Hit, Selection};
 use crate::graph::path::Path as CallPath;
 use crate::model::{Provenance, SymbolId};
+
+/// 受影響範圍裡每個符號最多列幾個檔案。
+const BLAST_FILES: usize = 5;
 
 /// 讀不到原始碼時顯示的說明。
 const FALLBACK_NOTE: &str = "（讀不到原始碼，以下僅有簽名）";
@@ -76,12 +79,65 @@ pub fn reporting(root: &Path, selection: &Selection, budget: Budget) -> (String,
         .ok();
     }
 
+    render_blast(&mut out, &selection.blast);
+
     if !selection.unmatched.is_empty() {
         writeln!(out).ok();
         writeln!(out, "查無結果：{}", selection.unmatched.join("、")).ok();
     }
 
     (out, emitted)
+}
+
+/// 排版受影響範圍。
+///
+/// 依檔案彙總而不是逐條列。專案裡光是一個 `Result` 就有近百個入邊，攤
+/// 開會把原始碼擠出畫面，而原始碼才是呼叫端要的東西。
+fn render_blast(out: &mut String, blast: &[Blast]) {
+    if blast.is_empty() {
+        return;
+    }
+
+    writeln!(out).ok();
+    writeln!(out, "## Blast radius").ok();
+
+    for item in blast {
+        writeln!(out).ok();
+        writeln!(
+            out,
+            "  {} {}  {} 處",
+            item.kind.as_str(),
+            item.qualified,
+            item.impact.total
+        )
+        .ok();
+
+        let width = item
+            .impact
+            .files
+            .iter()
+            .take(BLAST_FILES)
+            .map(|u| u.file.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(48);
+
+        for users in item.impact.files.iter().take(BLAST_FILES) {
+            writeln!(
+                out,
+                "    {:<width$}  {}",
+                users.file,
+                users.count,
+                width = width
+            )
+            .ok();
+        }
+
+        let rest = item.impact.files.len().saturating_sub(BLAST_FILES);
+        if rest > 0 {
+            writeln!(out, "    另有 {rest} 個檔案").ok();
+        }
+    }
 }
 
 /// 排版呼叫路徑。
@@ -288,6 +344,7 @@ mod tests {
     use super::*;
     use crate::explore::budget;
     use crate::explore::select::Origin;
+    use crate::graph::impact::{Impact, Users};
     use crate::graph::path::Hop;
     use crate::model::{Kind, SymbolId};
 
@@ -396,6 +453,7 @@ mod tests {
         let selection = Selection {
             hits: vec![hit("src/a.rs", 1, 1, "one")],
             flows: Vec::new(),
+            blast: Vec::new(),
             unmatched: vec!["missing".into()],
             suggestions: vec![],
         };
@@ -413,6 +471,7 @@ mod tests {
         let selection = Selection {
             hits: vec![],
             flows: Vec::new(),
+            blast: Vec::new(),
             unmatched: vec!["opne".into()],
             suggestions: vec!["Store::open".into(), "open".into()],
         };
@@ -431,6 +490,7 @@ mod tests {
         let selection = Selection {
             hits: vec![],
             flows: Vec::new(),
+            blast: Vec::new(),
             unmatched: vec!["zzz".into()],
             suggestions: vec![],
         };
@@ -538,6 +598,7 @@ mod tests {
             Selection {
                 hits: vec![],
                 flows: Vec::new(),
+                blast: Vec::new(),
                 unmatched: vec!["zzz".into()],
                 suggestions: vec![],
             },
@@ -654,6 +715,88 @@ mod tests {
         let out = render(&root, &selection, generous());
 
         assert_eq!(out.matches("[heuristic]").count(), 1, "{out}");
+    }
+
+    /// 受影響範圍依檔案彙總，排在原始碼之後。
+    #[test]
+    fn the_blast_radius_summarises_by_file() {
+        let root = tmpdir("blast");
+        std::fs::write(root.join("src/a.rs"), "fn one() {}\n").unwrap();
+
+        let selection = Selection {
+            hits: vec![hit("src/a.rs", 1, 1, "one")],
+            blast: vec![Blast {
+                qualified: "Widget".into(),
+                kind: Kind::Struct,
+                impact: Impact {
+                    files: vec![
+                        Users {
+                            file: "src/b.rs".into(),
+                            count: 4,
+                        },
+                        Users {
+                            file: "src/c.rs".into(),
+                            count: 1,
+                        },
+                    ],
+                    total: 5,
+                },
+            }],
+            ..Default::default()
+        };
+        let out = render(&root, &selection, generous());
+
+        assert!(out.contains("## Blast radius"), "{out}");
+        assert!(out.contains("struct Widget  5 處"), "{out}");
+        assert!(out.contains("src/b.rs"), "{out}");
+        assert!(
+            out.find("## Source") < out.find("## Blast radius"),
+            "影響範圍該排在原始碼之後：{out}"
+        );
+    }
+
+    /// 檔案太多時只列前幾個，其餘用一行帶過。
+    #[test]
+    fn a_widely_used_symbol_lists_only_the_heaviest_files() {
+        let root = tmpdir("blastmany");
+        std::fs::write(root.join("src/a.rs"), "fn one() {}\n").unwrap();
+
+        let files: Vec<Users> = (0..BLAST_FILES + 3)
+            .map(|i| Users {
+                file: format!("src/f{i}.rs"),
+                count: 1,
+            })
+            .collect();
+        let total = files.len();
+
+        let selection = Selection {
+            hits: vec![hit("src/a.rs", 1, 1, "one")],
+            blast: vec![Blast {
+                qualified: "Result".into(),
+                kind: Kind::TypeAlias,
+                impact: Impact { files, total },
+            }],
+            ..Default::default()
+        };
+        let out = render(&root, &selection, generous());
+
+        assert_eq!(out.matches("src/f").count(), BLAST_FILES, "{out}");
+        assert!(out.contains("另有 3 個檔案"), "{out}");
+    }
+
+    /// 沒有人依賴的符號不印空區塊。
+    #[test]
+    fn nothing_depends_on_it_means_no_section() {
+        let root = tmpdir("noblast");
+        std::fs::write(root.join("src/a.rs"), "fn one() {}\n").unwrap();
+
+        let selection = Selection {
+            hits: vec![hit("src/a.rs", 1, 1, "one")],
+            ..Default::default()
+        };
+        let out = render(&root, &selection, generous());
+
+        assert!(!out.contains("## Blast radius"), "{out}");
     }
 
     #[test]

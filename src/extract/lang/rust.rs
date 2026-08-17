@@ -4,6 +4,8 @@
 //! 祖先節點，容器名稱也需要沿祖先鏈累積，這類帶上下文的判斷用宣告式
 //! query 表達不便。
 
+use std::collections::HashSet;
+
 use tree_sitter::{Language, Node};
 
 use super::super::ts;
@@ -104,7 +106,9 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
                 let Some(name) = field_text(child, "name", source) else {
                     continue;
                 };
-                push(child, source, path, scope, Kind::Trait, name, out);
+                let moniker = push(child, source, path, scope, Kind::Trait, name, out);
+                // 本體裡的方法簽名各自是符號，各自記自己用到的型別。
+                collect_types(child, source, &moniker, Body::Skip, out);
                 descend(child, source, path, &scope.child(name, true), out);
             }
             // impl 區塊本身不是符號，只提供方法所屬的型別。
@@ -113,7 +117,9 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
                     .child_by_field_name("type")
                     .map(|n| type_base_name(n, source))
                     .unwrap_or_else(|| "impl".to_string());
+                let before = out.symbols.len();
                 descend(child, source, path, &scope.child(&name, true), out);
+                collect_implemented_trait(child, source, before, out);
             }
             // 不把本體裡的巢狀函數當成符號，它們無法從外部呼叫，但本體
             // 裡的呼叫仍要記錄下來。
@@ -127,12 +133,15 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
                     Kind::Function
                 };
                 let moniker = push(child, source, path, scope, kind, name, out);
+                // 本體裡的型別是區域的實作細節，不算這個函數的對外依賴。
+                collect_types(child, source, &moniker, Body::Skip, out);
                 if let Some(body) = child.child_by_field_name("body") {
                     let mut bindings = Bindings::new();
                     bind_parameters(child, source, scope, &mut bindings);
                     collect_calls(body, source, &moniker, &mut bindings, out);
                 }
             }
+            // 欄位與變體的型別都在本體裡，這幾種要連本體一起看。
             "struct_item" => leaf(child, source, path, scope, Kind::Struct, out),
             "enum_item" => leaf(child, source, path, scope, Kind::Enum, out),
             "union_item" => leaf(child, source, path, scope, Kind::Struct, out),
@@ -152,7 +161,146 @@ fn descend(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut Fi
 
 fn leaf(node: Node<'_>, source: &str, path: &str, scope: &Scope, kind: Kind, out: &mut FileParse) {
     if let Some(name) = field_text(node, "name", source) {
-        push(node, source, path, scope, kind, name, out);
+        let moniker = push(node, source, path, scope, kind, name, out);
+        collect_types(node, source, &moniker, Body::Include, out);
+    }
+}
+
+/// 找型別時要不要連宣告的本體一起看。
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Body {
+    /// 結構的欄位、列舉的變體都在本體裡，那些型別就是這個宣告的依賴。
+    Include,
+    /// 函數本體裡的型別是區域的實作細節，trait 本體裡的簽名各自是符號。
+    Skip,
+}
+
+/// 記下宣告用到的型別，成為 `UsesType` 引用。
+///
+/// 這是 blast radius 的材料：改一個型別會波及誰，答案就是誰的宣告提到
+/// 了它。呼叫關係回答不了這個問題——把一個型別多加一個欄位，用到它的
+/// 函數一個都沒被呼叫，照樣全部要跟著改。
+fn collect_types(node: Node<'_>, source: &str, from: &str, body: Body, out: &mut FileParse) {
+    // 自己宣告的泛型參數不是對外依賴，`fn f<T>(x: T)` 的 `T` 不指向任何
+    // 符號。約束裡的型別則要記，`T: Extractor` 確實用到了 Extractor。
+    let declared = declared_type_parameters(node, source);
+    let skip_body = (body == Body::Skip)
+        .then(|| node.child_by_field_name("body"))
+        .flatten();
+    // `struct Widget` 的 `Widget` 在語法上也是個型別節點，但那是這個
+    // 宣告自己，不是它用到的東西。
+    let own_name = node.child_by_field_name("name");
+
+    let mut found: Vec<(String, u32)> = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if Some(child) == skip_body || Some(child) == own_name {
+            continue;
+        }
+        gather_types(child, source, &declared, &mut found);
+    }
+
+    for (name, line) in found {
+        out.refs.push(RawRef {
+            from: from.to_string(),
+            name,
+            rel: Rel::UsesType,
+            line,
+        });
+    }
+}
+
+/// `impl Trait for Type` 的 `Trait`，記到這個區塊裡的每個方法名下。
+///
+/// impl 區塊本身不是符號，沒有東西可以當引用的起點。記到方法上是真的：
+/// 那些方法之所以存在，就是因為要實作這個 trait。自身型別（`for` 後面
+/// 那個）不記——方法屬於它是同一件事的兩種說法，記了只是噪音。
+fn collect_implemented_trait(node: Node<'_>, source: &str, from_index: usize, out: &mut FileParse) {
+    let Some(implemented) = node.child_by_field_name("trait") else {
+        return;
+    };
+
+    let declared = declared_type_parameters(node, source);
+    let mut found: Vec<(String, u32)> = Vec::new();
+    gather_types(implemented, source, &declared, &mut found);
+    if found.is_empty() {
+        return;
+    }
+
+    let monikers: Vec<String> = out.symbols[from_index..]
+        .iter()
+        .map(|s| s.moniker.clone())
+        .collect();
+    for moniker in monikers {
+        for (name, line) in &found {
+            out.refs.push(RawRef {
+                from: moniker.clone(),
+                name: name.clone(),
+                rel: Rel::Implements,
+                line: *line,
+            });
+        }
+    }
+}
+
+/// 這個宣告自己引入的泛型參數名。
+fn declared_type_parameters(node: Node<'_>, source: &str) -> HashSet<String> {
+    let mut declared = HashSet::new();
+    // 依節點種類而不是欄位名尋找：不同宣告把泛型參數掛在不同的欄位下。
+    let mut top = node.walk();
+    let Some(parameters) = node
+        .named_children(&mut top)
+        .find(|c| c.kind() == "type_parameters")
+    else {
+        return declared;
+    };
+
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        // 裸的 `T` 自己就是名字；帶約束或預設值的把名字放在欄位裡，而
+        // 欄位名依語法版本而異，兩個都試。
+        let named = if parameter.kind() == "type_identifier" {
+            Some(parameter)
+        } else {
+            parameter
+                .child_by_field_name("name")
+                .or_else(|| parameter.child_by_field_name("left"))
+        };
+        if let Some(named) = named
+            && named.kind() == "type_identifier"
+        {
+            declared.insert(ts::text(named, source).to_string());
+        }
+    }
+    declared
+}
+
+/// 收集節點底下出現的型別名，同一個名字只記第一次出現的位置。
+fn gather_types(
+    node: Node<'_>,
+    source: &str,
+    declared: &HashSet<String>,
+    found: &mut Vec<(String, u32)>,
+) {
+    // `crate::a::Widget` 只記 `Widget`，前面幾段是路徑不是型別。
+    let named = match node.kind() {
+        "type_identifier" => Some(node),
+        "scoped_type_identifier" => node.child_by_field_name("name"),
+        _ => None,
+    };
+
+    if let Some(named) = named {
+        let name = ts::text(named, source);
+        // `Self` 指的是所屬的型別，不是另一個符號。
+        if name != "Self" && !declared.contains(name) && !found.iter().any(|(n, _)| n == name) {
+            found.push((name.to_string(), ts::line_of(named)));
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        gather_types(child, source, declared, found);
     }
 }
 
@@ -626,7 +774,8 @@ mod tests {
         assert!(p.errors.is_empty());
     }
 
-    fn refs_of(p: &FileParse, from_name: &str) -> Vec<String> {
+    /// 某個符號發出的、指定種類的引用。
+    fn refs_by(p: &FileParse, from_name: &str, rel: Rel) -> Vec<String> {
         let from = p
             .symbols
             .iter()
@@ -634,9 +783,115 @@ mod tests {
             .unwrap_or_else(|| panic!("找不到 {from_name}"));
         p.refs
             .iter()
-            .filter(|r| r.from == from.moniker)
+            .filter(|r| r.from == from.moniker && r.rel == rel)
             .map(|r| r.name.clone())
             .collect()
+    }
+
+    fn refs_of(p: &FileParse, from_name: &str) -> Vec<String> {
+        refs_by(p, from_name, Rel::Calls)
+    }
+
+    fn types_of(p: &FileParse, from_name: &str) -> Vec<String> {
+        refs_by(p, from_name, Rel::UsesType)
+    }
+
+    #[test]
+    fn a_signature_records_the_types_it_mentions() {
+        let p = parse("fn build(w: Widget, n: u32) -> Report {\n    make()\n}\n");
+
+        assert_eq!(types_of(&p, "build"), ["Widget", "Report"]);
+    }
+
+    /// 原生型別不是符號，記了只會變成永遠解析不了的雜訊。
+    #[test]
+    fn primitives_are_not_type_references() {
+        let p = parse("fn count(n: u32, ok: bool) -> usize {\n    0\n}\n");
+
+        assert!(
+            types_of(&p, "count").is_empty(),
+            "{:?}",
+            types_of(&p, "count")
+        );
+    }
+
+    /// 結構的欄位型別就是它的依賴。
+    #[test]
+    fn struct_fields_record_their_types() {
+        let p = parse("struct Holder {\n    inner: Widget,\n    tags: Vec<Label>,\n}\n");
+
+        assert_eq!(types_of(&p, "Holder"), ["Widget", "Vec", "Label"]);
+    }
+
+    /// 宣告自己的名字不是它用到的型別。
+    #[test]
+    fn a_declaration_does_not_reference_itself() {
+        let p = parse("struct Widget;\nenum Colour { Red }\ntype Alias = Widget;\n");
+
+        assert!(types_of(&p, "Widget").is_empty());
+        assert!(types_of(&p, "Colour").is_empty());
+        assert_eq!(types_of(&p, "Alias"), ["Widget"]);
+    }
+
+    /// 自己引入的泛型參數不指向任何符號，但約束裡的型別要記。
+    #[test]
+    fn generic_parameters_are_skipped_but_their_bounds_are_not() {
+        let p = parse("fn run<T: Extractor>(item: T) -> T {\n    item\n}\n");
+
+        assert_eq!(types_of(&p, "run"), ["Extractor"]);
+    }
+
+    /// 路徑只記最後那一段，`crate::a::Widget` 與 `Widget` 是同一個型別。
+    #[test]
+    fn a_scoped_type_records_only_its_base_name() {
+        let p = parse("fn take(w: crate::a::Widget) {}\n");
+
+        assert_eq!(types_of(&p, "take"), ["Widget"]);
+    }
+
+    /// `Self` 指的是所屬型別，不是另一個符號。
+    #[test]
+    fn self_is_not_a_type_reference() {
+        let p = parse("struct A;\nimpl A {\n    fn make() -> Self {\n        A\n    }\n}\n");
+
+        assert!(types_of(&p, "A::make").is_empty());
+    }
+
+    /// 本體裡的型別是實作細節，不算這個函數的對外依賴。
+    #[test]
+    fn types_inside_a_body_are_not_counted() {
+        let p = parse("fn run() {\n    let x: Local = Local::new();\n}\n");
+
+        assert!(types_of(&p, "run").is_empty(), "{:?}", types_of(&p, "run"));
+    }
+
+    /// 實作一個 trait 記在該區塊的每個方法名下——impl 本身不是符號。
+    #[test]
+    fn implementing_a_trait_is_recorded_on_its_methods() {
+        let p = parse(
+            "struct Square;\nimpl Shape for Square {\n    fn area(&self) {}\n    fn name(&self) {}\n}\n",
+        );
+
+        for method in ["Square::area", "Square::name"] {
+            let implemented = refs_by(&p, method, Rel::Implements);
+            assert_eq!(implemented, ["Shape"], "{method}");
+        }
+    }
+
+    /// 沒有 trait 的 inherent impl 不產生實作關係。
+    #[test]
+    fn an_inherent_impl_implements_nothing() {
+        let p = parse("struct A;\nimpl A {\n    fn run(&self) {}\n}\n");
+
+        assert!(refs_by(&p, "A::run", Rel::Implements).is_empty());
+    }
+
+    /// 同一個型別在一個宣告裡出現多次只記一次，避免同一條邊灌水。
+    #[test]
+    fn a_type_named_twice_in_one_declaration_is_recorded_once() {
+        let p = parse("fn swap(a: Widget, b: Widget) -> Widget {\n    a\n}\n");
+
+        assert_eq!(types_of(&p, "swap"), ["Widget"]);
     }
 
     #[test]
