@@ -3,11 +3,17 @@
 //! 新增一個語言只需新增一個模組並在 [`all`] 加入一項。
 
 pub mod bindings;
+pub mod python;
 pub mod rust;
+pub mod typescript;
 
 /// 所有已註冊的抽取器。
 fn all() -> &'static [&'static dyn super::Extractor] {
-    &[&rust::RustExtractor]
+    &[
+        &rust::RustExtractor,
+        &typescript::TypeScriptExtractor,
+        &python::PythonExtractor,
+    ]
 }
 
 /// 依副檔名取得抽取器，副檔名不含點。
@@ -44,11 +50,26 @@ mod tests {
     fn lookup_is_by_bare_extension() {
         assert!(by_extension("rs").is_some());
         assert!(by_extension(".rs").is_none(), "副檔名不應該帶點");
-        assert!(by_extension("py").is_none());
+        assert!(by_extension("go").is_none(), "還沒註冊的語言不該有抽取器");
+    }
+
+    /// 每個語言各認自己的副檔名，查得到對的那一個。
+    #[test]
+    fn each_language_owns_its_extensions() {
+        for (ext, language) in [
+            ("rs", "rust"),
+            ("ts", "typescript"),
+            ("tsx", "typescript"),
+            ("py", "python"),
+            ("pyi", "python"),
+        ] {
+            let found = by_extension(ext).unwrap_or_else(|| panic!("{ext} 沒有抽取器"));
+            assert_eq!(found.language(), language, "{ext}");
+        }
     }
 
     #[test]
     fn language_names_are_listed() {
-        assert_eq!(languages(), vec!["rust"]);
+        assert_eq!(languages(), vec!["rust", "typescript", "python"]);
     }
 }

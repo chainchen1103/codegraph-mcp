@@ -2,6 +2,7 @@
 //!
 //! 每個專案的索引放在根目錄底下的 `.codegraph/`，內含資料庫與設定檔。
 
+pub mod unit;
 pub mod walk;
 
 use std::path::{Path, PathBuf};
@@ -105,40 +106,25 @@ impl Project {
     }
 }
 
-/// 這些目錄各自是一棵原始碼樹的根。
-const SOURCE_ROOTS: [&str; 4] = ["src", "tests", "benches", "examples"];
-
 /// 檔案在模組樹中的位置。
 ///
 /// 呼叫寫成 `ts::parse` 時，`ts` 指的是模組而不是型別，而模組對應到
 /// 檔案系統：`src/extract/ts.rs` 就是 `extract::ts`。符號的限定名只
 /// 記錄檔案內部的巢狀結構，這一段資訊得從路徑補回來。
 ///
-/// 慣例：`mod.rs`、`lib.rs`、`main.rs` 代表所在目錄本身；`src/` 以外
-/// 的根目錄底下每個檔案自成一個 crate，模組路徑為空。
+/// 規則因語言而異，因此交給該語言的抽取器決定；沒有抽取器認領的檔案
+/// 不進索引，模組路徑為空。
 pub fn module_path(rel_path: &str) -> String {
-    let normalized = rel_path.replace('\\', "/");
-    let mut segments: Vec<&str> = normalized.split('/').collect();
+    crate::extract::extractor_for(Path::new(rel_path))
+        .map(|e| e.module_path(rel_path))
+        .unwrap_or_default()
+}
 
-    let Some(stem) = segments.pop().and_then(|f| f.strip_suffix(".rs")) else {
-        return String::new();
-    };
-
-    let in_src = segments.first() == Some(&"src");
-    if segments.first().is_some_and(|s| SOURCE_ROOTS.contains(s)) {
-        segments.remove(0);
-    }
-
-    // src 以外的根目錄，每個檔案自成一個 crate 的根。
-    if !in_src && segments.is_empty() {
-        return String::new();
-    }
-
-    if !matches!(stem, "mod" | "lib" | "main") {
-        segments.push(stem);
-    }
-
-    segments.join("::")
+/// 認領這個檔案的語言，沒有抽取器認領時回空字串。
+pub fn language_of(rel_path: &str) -> &'static str {
+    crate::extract::extractor_for(Path::new(rel_path))
+        .map(|e| e.language())
+        .unwrap_or("")
 }
 
 /// 取得絕對路徑。

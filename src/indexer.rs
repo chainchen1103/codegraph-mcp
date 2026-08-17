@@ -4,9 +4,9 @@ use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::extract;
-use crate::project::{self, Project, walk};
+use crate::project::{self, Project, unit, walk};
 use crate::resolve::{self, ResolveReport};
-use crate::store::write::{Writer, rebuild_fts};
+use crate::store::write::{FileMeta, Writer, rebuild_fts};
 use crate::store::{Store, content_hash};
 
 /// 一次交易涵蓋的檔案數。
@@ -14,9 +14,6 @@ use crate::store::{Store, content_hash};
 /// 交易太小會讓每個檔案都付出一次 fsync，太大則在中途失敗時損失較多
 /// 已完成的工作。
 const BATCH_FILES: usize = 500;
-
-/// 尚未支援多個編譯單元，全部檔案歸在同一個單元底下。
-const DEFAULT_UNIT: &str = "root";
 
 /// 一次索引的結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -47,7 +44,7 @@ pub fn index_project(project: &Project, store: &mut Store) -> Result<IndexReport
 
     store.with_transaction(|conn| {
         Writer::reset(conn)?;
-        writer.unit(conn, DEFAULT_UNIT)?;
+        writer.unit(conn, unit::ROOT)?;
         Ok(())
     })?;
 
@@ -84,11 +81,24 @@ pub fn index_project(project: &Project, store: &mut Store) -> Result<IndexReport
         }
 
         let written = store.with_transaction(|conn| {
-            let unit = writer.unit(conn, DEFAULT_UNIT)?;
             let mut totals = (0usize, 0usize, 0usize);
             for (rel_path, hash, parse) in &parsed {
+                // 單元由檔案所在位置決定，monorepo 裡每個 manifest 各自成
+                // 一個單元。
+                let unit = writer.unit(conn, &unit::of(project.root(), rel_path))?;
                 let module = project::module_path(rel_path);
-                let w = writer.write_file(conn, unit, rel_path, &module, hash, parse)?;
+                let language = project::language_of(rel_path);
+                let w = writer.write_file(
+                    conn,
+                    unit,
+                    FileMeta {
+                        rel_path,
+                        module_path: &module,
+                        language,
+                        content_hash: hash,
+                    },
+                    parse,
+                )?;
                 totals.0 += 1;
                 totals.1 += w.symbols;
                 totals.2 += w.skipped;

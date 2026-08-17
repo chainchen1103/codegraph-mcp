@@ -25,7 +25,18 @@ pub fn indexed(files: &[(&str, &str)]) -> Store {
             for (path, text) in files {
                 let parse = extract::extract(path, text).unwrap();
                 let module = crate::project::module_path(path);
-                writer.write_file(conn, unit, path, &module, "hash", &parse)?;
+                let language = crate::project::language_of(path);
+                writer.write_file(
+                    conn,
+                    unit,
+                    crate::store::write::FileMeta {
+                        rel_path: path,
+                        module_path: &module,
+                        language,
+                        content_hash: "hash",
+                    },
+                    &parse,
+                )?;
             }
             rebuild_fts(conn)
         })

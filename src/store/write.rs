@@ -14,6 +14,19 @@ use crate::extract::FileParse;
 /// 短碼的起始長度，以十六進位字元計。
 const HANDLE_LENGTHS: [usize; 6] = [6, 8, 12, 16, 24, 32];
 
+/// 一個檔案在索引裡的身分。
+///
+/// 這幾項都由呼叫端決定而不是這一層推導：模組路徑與語言取決於專案佈局
+/// 與抽取器，雜湊取決於讀進來的位元組。
+#[derive(Clone, Copy, Debug)]
+pub struct FileMeta<'a> {
+    /// 相對於專案根目錄。
+    pub rel_path: &'a str,
+    pub module_path: &'a str,
+    pub language: &'a str,
+    pub content_hash: &'a str,
+}
+
 /// 單一檔案寫入後的結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileWritten {
@@ -100,16 +113,20 @@ impl Writer {
         &mut self,
         conn: &Connection,
         unit_id: u32,
-        rel_path: &str,
-        module_path: &str,
-        content_hash: &str,
+        file: FileMeta<'_>,
         parse: &FileParse,
     ) -> Result<FileWritten> {
+        let FileMeta {
+            rel_path,
+            module_path,
+            language,
+            content_hash,
+        } = file;
         let file_id = self.lookup(conn, Pool::Paths, rel_path)?.id;
 
         conn.execute(
-            "INSERT OR REPLACE INTO files(id, path, unit_id, is_test, is_generated, content_hash, module_path, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7)",
+            "INSERT OR REPLACE INTO files(id, path, unit_id, is_test, is_generated, content_hash, module_path, language, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 file_id,
                 rel_path,
@@ -117,6 +134,7 @@ impl Writer {
                 looks_like_test(rel_path) as i64,
                 content_hash,
                 module_path,
+                language,
                 now_millis(),
             ],
         )?;
@@ -341,7 +359,17 @@ mod tests {
                 Writer::reset(conn)?;
                 let unit = writer.unit(conn, "root")?;
                 for (path, parse) in files {
-                    writer.write_file(conn, unit, path, "", "hash", parse)?;
+                    writer.write_file(
+                        conn,
+                        unit,
+                        FileMeta {
+                            rel_path: path,
+                            module_path: "",
+                            language: "rust",
+                            content_hash: "hash",
+                        },
+                        parse,
+                    )?;
                 }
                 rebuild_fts(conn)
             })
@@ -494,9 +522,12 @@ mod tests {
                 writer.write_file(
                     conn,
                     unit,
-                    "src/a.rs",
-                    "",
-                    "hash",
+                    FileMeta {
+                        rel_path: "src/a.rs",
+                        module_path: "",
+                        language: "rust",
+                        content_hash: "hash",
+                    },
                     &parse_of(vec![
                         symbol("src/a.rs:function:dup:1", "dup", 1),
                         symbol("src/a.rs:function:dup:1", "dup", 1),
@@ -544,9 +575,12 @@ mod tests {
                 first.write_file(
                     conn,
                     unit,
-                    "src/gone.rs",
-                    "",
-                    "hash",
+                    FileMeta {
+                        rel_path: "src/gone.rs",
+                        module_path: "",
+                        language: "rust",
+                        content_hash: "hash",
+                    },
                     &parse_of(vec![symbol("src/gone.rs:function:old:1", "old", 1)]),
                 )
             })
@@ -560,9 +594,12 @@ mod tests {
                 second.write_file(
                     conn,
                     unit,
-                    "src/kept.rs",
-                    "",
-                    "hash",
+                    FileMeta {
+                        rel_path: "src/kept.rs",
+                        module_path: "",
+                        language: "rust",
+                        content_hash: "hash",
+                    },
                     &parse_of(vec![symbol("src/kept.rs:function:new:1", "new", 1)]),
                 )
             })
@@ -590,9 +627,12 @@ mod tests {
             writer.write_file(
                 conn,
                 unit,
-                "src/a.rs",
-                "",
-                "hash",
+                FileMeta {
+                    rel_path: "src/a.rs",
+                    module_path: "",
+                    language: "rust",
+                    content_hash: "hash",
+                },
                 &parse_of(vec![symbol("src/a.rs:function:one:1", "one", 1)]),
             )?;
             Err(crate::error::CgError::Corrupt {

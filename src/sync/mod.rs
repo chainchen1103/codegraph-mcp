@@ -12,13 +12,10 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::extract;
-use crate::project::{Project, walk};
+use crate::project::{Project, unit, walk};
 use crate::resolve;
-use crate::store::write::Writer;
+use crate::store::write::{FileMeta, Writer};
 use crate::store::{Store, content_hash};
-
-/// 尚未支援多個編譯單元，全部檔案歸在同一個單元底下。
-const DEFAULT_UNIT: &str = "root";
 
 /// 單一檔案的同步結果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,8 +152,19 @@ fn sync_one(
         clear_file(conn, rel_path)?;
 
         let mut writer = Writer::resume(conn)?;
-        let unit = writer.unit(conn, DEFAULT_UNIT)?;
-        writer.write_file(conn, unit, rel_path, &module, &hash, &parse)?;
+        let unit = writer.unit(conn, &unit::of(project.root(), rel_path))?;
+        let language = crate::project::language_of(rel_path);
+        writer.write_file(
+            conn,
+            unit,
+            FileMeta {
+                rel_path,
+                module_path: &module,
+                language,
+                content_hash: &hash,
+            },
+            &parse,
+        )?;
 
         drop_edges_into_vanished(conn, rel_path, &old)?;
 

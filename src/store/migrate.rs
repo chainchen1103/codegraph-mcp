@@ -115,6 +115,10 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<()> {
             // 3 到 4：待重試的引用多了一種狀態，部分索引的條件跟著放寬。
             // 條件變了就是另一個索引，必須先卸下舊的。
             3 => conn.execute_batch("DROP INDEX IF EXISTS idx_unresolved_tail;")?,
+            // 4 到 5：檔案記下是哪個語言的抽取器認領的。舊的列留空，
+            // 下一次全量索引會填上。
+            4 => conn
+                .execute_batch("ALTER TABLE files ADD COLUMN language TEXT NOT NULL DEFAULT '';")?,
             other => {
                 return Err(CgError::Corrupt {
                     detail: format!("沒有從版本 {other} 升級的路徑"),
@@ -278,9 +282,11 @@ mod tests {
     fn upgrading_from_v3_widens_the_retry_index() {
         let conn = mem();
         conn.execute_batch(SCHEMA).unwrap();
+        // 回推成 v3 當時的形狀：舊的部分索引條件，而且還沒有 language 欄位。
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_unresolved_tail;
              CREATE INDEX idx_unresolved_tail ON unresolved_refs(name_tail) WHERE status = 1;
+             ALTER TABLE files DROP COLUMN language;
              INSERT INTO schema_versions(version, applied_at, note) VALUES (3, 0, 'v3');",
         )
         .unwrap();

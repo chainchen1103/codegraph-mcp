@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS files (
     -- 檔案在模組樹中的位置，例如 src/extract/ts.rs 是 extract::ts。
     -- 符號的限定名只記錄檔案內部的巢狀結構，模組層級靠這個欄位補回來。
     module_path  TEXT NOT NULL DEFAULT '',
+    -- 認領這個檔案的抽取器，例如 rust / typescript / python。
+    language     TEXT NOT NULL DEFAULT '',
     indexed_at   INTEGER NOT NULL
 );
 

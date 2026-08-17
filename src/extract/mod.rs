@@ -39,6 +39,17 @@ pub trait Extractor: Send + Sync {
     ///
     /// `rel_path` 必須相對於專案根目錄，它是 moniker 的組成部分。
     fn extract(&self, rel_path: &str, source: &str) -> FileParse;
+
+    /// 這個檔案在該語言模組樹中的位置。
+    ///
+    /// 符號的限定名只記錄檔案內部的巢狀結構，`src/extract/ts.rs` 裡的
+    /// `parse` 限定名就是 `parse`。引用寫成 `ts::parse` 時前面那一段
+    /// 指的是檔案位置，解析階段要靠這個值才對得上。
+    ///
+    /// 每個語言的規則都不一樣，所以是抽取器的責任而不是專案佈局的：
+    /// Rust 的 `mod.rs` 代表所在目錄，Python 的是 `__init__.py`，
+    /// TypeScript 根本不用這種形式。沒有這一層的語言回空字串。
+    fn module_path(&self, rel_path: &str) -> String;
 }
 
 /// 依副檔名取得抽取器，不支援的副檔名回 `None`。

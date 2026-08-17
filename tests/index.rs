@@ -182,3 +182,63 @@ fn symbols_never_outlive_the_file_they_came_from() {
     let left: i64 = query_one(&store, "SELECT count(*) FROM symbols");
     assert_eq!(left, 1, "刪除檔案沒有連帶清掉它的符號");
 }
+
+/// 混語言 repo：TS 前端 + Python 後端 + Rust 工具，索引不互相污染。
+///
+/// 同名符號散在三個語言裡，各自的邊只能連到自己那一邊。
+#[test]
+fn a_mixed_language_repo_keeps_each_language_separate() {
+    let f = Fixture::indexed(
+        "mixed",
+        &[
+            (
+                "web/api.ts",
+                "export function handler(): void {\n  render();\n}\n\
+                 export function render(): void {}\n",
+            ),
+            (
+                "api/views.py",
+                "def handler():\n    render()\n\ndef render():\n    pass\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn handler() {\n    render();\n}\npub fn render() {}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    // 每個檔案都被認出語言。
+    let mut languages: Vec<String> = store
+        .conn()
+        .prepare("SELECT DISTINCT language FROM files ORDER BY language")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    languages.sort();
+    assert_eq!(languages, ["python", "rust", "typescript"]);
+
+    // 三個 handler 各自呼叫自己檔案裡的 render，沒有跨語言接錯。
+    let crossed: i64 = store
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM relations r
+             JOIN symbols src ON src.id = r.src
+             JOIN symbols dst ON dst.id = r.dst
+             JOIN files sf ON sf.id = src.file_id
+             JOIN files df ON df.id = dst.file_id
+             WHERE sf.language != df.language",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(crossed, 0, "有邊跨過了語言邊界");
+
+    let edges: i64 = store
+        .conn()
+        .query_row("SELECT count(*) FROM relations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(edges, 3, "每個語言各該有一條 handler → render");
+}

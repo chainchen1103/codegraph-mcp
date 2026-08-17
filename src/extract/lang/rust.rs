@@ -52,7 +52,37 @@ impl Extractor for RustExtractor {
         walk(root, source, &path, &Scope::default(), &mut out);
         out
     }
+
+    /// 慣例：`mod.rs`、`lib.rs`、`main.rs` 代表所在目錄本身；`src/` 以外
+    /// 的根目錄底下每個檔案自成一個 crate，模組路徑為空。
+    fn module_path(&self, rel_path: &str) -> String {
+        let normalized = rel_path.replace('\\', "/");
+        let mut segments: Vec<&str> = normalized.split('/').collect();
+
+        let Some(stem) = segments.pop().and_then(|f| f.strip_suffix(".rs")) else {
+            return String::new();
+        };
+
+        let in_src = segments.first() == Some(&"src");
+        if segments.first().is_some_and(|s| SOURCE_ROOTS.contains(s)) {
+            segments.remove(0);
+        }
+
+        // src 以外的根目錄，每個檔案自成一個 crate 的根。
+        if !in_src && segments.is_empty() {
+            return String::new();
+        }
+
+        if !matches!(stem, "mod" | "lib" | "main") {
+            segments.push(stem);
+        }
+
+        segments.join("::")
+    }
 }
+
+/// 這些目錄各自是一棵原始碼樹的根。
+const SOURCE_ROOTS: [&str; 4] = ["src", "tests", "benches", "examples"];
 
 /// 走訪時攜帶的上下文。
 #[derive(Clone, Debug, Default)]
