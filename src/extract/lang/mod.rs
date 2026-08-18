@@ -3,6 +3,7 @@
 //! 新增一個語言只需新增一個模組並在 [`all`] 加入一項。
 
 pub mod bindings;
+pub mod common;
 pub mod python;
 pub mod rust;
 pub mod typescript;

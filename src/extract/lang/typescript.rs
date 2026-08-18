@@ -11,11 +11,22 @@ use tree_sitter::{Language, Node};
 
 use super::super::ts;
 use super::super::{Extractor, FileParse, Import, ImportTarget};
+use super::common::{self, Declaration, TypeShapes};
 use crate::extract::moniker;
-use crate::model::{Kind, RawRef, RawSymbol, Rel};
+use crate::model::{Kind, RawRef, Rel};
 
 /// TypeScript 的文件註解前綴。
 const DOC_PREFIXES: &[&str] = &["//"];
+
+/// 型別名在 TypeScript 的語法樹裡長什麼樣。
+///
+/// `number` 這類內建型別是 `predefined_type`，不是 `type_identifier`，
+/// 自然不會被收進來。
+const TYPES: TypeShapes = TypeShapes {
+    leaves: &["type_identifier"],
+    scoped: &[],
+    opaque: &[],
+};
 
 /// 夾在文件註解與宣告之間、不打斷註解的節點。
 const DOC_SKIP: &[&str] = &["decorator"];
@@ -116,6 +127,31 @@ fn walk(node: Node<'_>, source: &str, path: &str, container: &[String], out: &mu
     }
 }
 
+/// 收下一個符號，補上 TypeScript 特有的簽名與註解取法。
+fn declare_symbol(
+    node: Node<'_>,
+    source: &str,
+    path: &str,
+    container: &[String],
+    kind: Kind,
+    name: &str,
+    out: &mut FileParse,
+) -> String {
+    common::push(
+        node,
+        path,
+        Declaration {
+            kind,
+            name,
+            container,
+            // 箭頭函數的本體掛在 value 底下，不是 body。
+            signature: common::signature(node, source, &["body", "value"], &['=', ':']),
+            docstring: ts::leading_line_comments(node, source, "comment", DOC_PREFIXES, DOC_SKIP),
+        },
+        out,
+    )
+}
+
 /// 走一條 `import`，把它引入的每個名字記下來。
 fn collect_import(node: Node<'_>, source: &str, out: &mut FileParse) {
     let Some(source_node) = node.child_by_field_name("source") else {
@@ -212,10 +248,10 @@ fn declare(
     kind: Kind,
     out: &mut FileParse,
 ) {
-    let Some(name) = field_text(node, "name", source) else {
+    let Some(name) = common::field_text(node, "name", source) else {
         return;
     };
-    let moniker = push(node, source, path, container, kind, name, out);
+    let moniker = declare_symbol(node, source, path, container, kind, name, out);
     collect_types(node, source, &moniker, Body::Skip, out);
 
     let mut nested = container.to_vec();
@@ -234,10 +270,10 @@ fn function(
     kind: Kind,
     out: &mut FileParse,
 ) {
-    let Some(name) = field_text(node, "name", source) else {
+    let Some(name) = common::field_text(node, "name", source) else {
         return;
     };
-    let moniker = push(node, source, path, container, kind, name, out);
+    let moniker = declare_symbol(node, source, path, container, kind, name, out);
     collect_types(node, source, &moniker, Body::Skip, out);
 
     if let Some(body) = node.child_by_field_name("body") {
@@ -254,15 +290,15 @@ fn leaf(
     kind: Kind,
     out: &mut FileParse,
 ) {
-    if let Some(name) = field_text(node, "name", source) {
-        let moniker = push(node, source, path, container, kind, name, out);
+    if let Some(name) = common::field_text(node, "name", source) {
+        let moniker = declare_symbol(node, source, path, container, kind, name, out);
         collect_types(node, source, &moniker, Body::Include, out);
     }
 }
 
 /// `const x = ...`：值是函數就記成函數，否則是常數。
 fn variable(node: Node<'_>, source: &str, path: &str, container: &[String], out: &mut FileParse) {
-    let Some(name) = field_text(node, "name", source) else {
+    let Some(name) = common::field_text(node, "name", source) else {
         return;
     };
     let value = node.child_by_field_name("value");
@@ -278,7 +314,7 @@ fn variable(node: Node<'_>, source: &str, path: &str, container: &[String], out:
     } else {
         Kind::Const
     };
-    let moniker = push(node, source, path, container, kind, name, out);
+    let moniker = declare_symbol(node, source, path, container, kind, name, out);
     collect_types(node, source, &moniker, Body::Skip, out);
 
     if let Some(value) = value {
@@ -355,7 +391,7 @@ fn collect_types(node: Node<'_>, source: &str, from: &str, body: Body, out: &mut
         if Some(child) == skip_body || Some(child) == own_name {
             continue;
         }
-        gather_types(child, source, &declared, &mut found);
+        common::gather_types(child, source, TYPES, &declared, &mut found);
     }
 
     for (name, line) in found {
@@ -388,75 +424,6 @@ fn declared_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
         }
     }
     declared
-}
-
-/// 收集節點底下出現的型別名。`number` 這類內建型別是 `predefined_type`，
-/// 不是 `type_identifier`，自然不會被收進來。
-fn gather_types(node: Node<'_>, source: &str, declared: &[String], found: &mut Vec<(String, u32)>) {
-    if node.kind() == "type_identifier" {
-        let name = ts::text(node, source);
-        if !declared.iter().any(|d| d == name) && !found.iter().any(|(n, _)| n == name) {
-            found.push((name.to_string(), ts::line_of(node)));
-        }
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        gather_types(child, source, declared, found);
-    }
-}
-
-/// 收下一個符號，回傳它的 moniker。
-fn push(
-    node: Node<'_>,
-    source: &str,
-    path: &str,
-    container: &[String],
-    kind: Kind,
-    name: &str,
-    out: &mut FileParse,
-) -> String {
-    let start_line = ts::line_of(node);
-    let qualified = if container.is_empty() {
-        name.to_string()
-    } else {
-        format!("{}::{name}", container.join("::"))
-    };
-    let moniker = moniker::build(path, kind, name, start_line);
-
-    out.symbols.push(RawSymbol {
-        moniker: moniker.clone(),
-        name: name.to_string(),
-        qualified,
-        kind,
-        start_line,
-        end_line: ts::end_line_of(node),
-        signature: signature(node, source),
-        docstring: ts::leading_line_comments(node, source, "comment", DOC_PREFIXES, DOC_SKIP),
-    });
-
-    moniker
-}
-
-/// 宣告的簽名，也就是本體之前的部分。
-fn signature(node: Node<'_>, source: &str) -> Option<String> {
-    let full = ts::text(node, source);
-    let cut = node
-        .child_by_field_name("body")
-        .or_else(|| node.child_by_field_name("value"))
-        .map(|b| b.start_byte() - node.start_byte())
-        .unwrap_or(full.len());
-    let decl = full
-        .get(..cut)?
-        .trim_end()
-        .trim_end_matches(&['=', ':'][..]);
-    let s = ts::collapse_whitespace(decl);
-    if s.is_empty() { None } else { Some(s) }
-}
-
-fn field_text<'a>(node: Node<'_>, field: &str, source: &'a str) -> Option<&'a str> {
-    node.child_by_field_name(field).map(|n| ts::text(n, source))
 }
 
 #[cfg(test)]
