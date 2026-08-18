@@ -4,21 +4,31 @@
 //! 祖先節點，容器名稱也需要沿祖先鏈累積，這類帶上下文的判斷用宣告式
 //! query 表達不便。
 
-use std::collections::HashSet;
-
 use tree_sitter::{Language, Node};
 
 use super::super::ts;
 use super::super::{Extractor, FileParse, Import, ImportTarget};
 use super::bindings::Bindings;
+use super::common::{self, Declaration, TypeShapes};
 use crate::extract::moniker;
-use crate::model::{Kind, RawRef, RawSymbol, Rel};
+use crate::model::{Kind, RawRef, Rel};
 
 /// Rust 的文件註解前綴。
 const DOC_PREFIXES: &[&str] = &["///", "//!"];
 
 /// 夾在文件註解與宣告之間、不打斷註解的節點。
 const DOC_SKIP: &[&str] = &["attribute_item"];
+
+/// 型別名在 Rust 的語法樹裡長什麼樣。
+///
+/// 原生型別是 `primitive_type`，不是 `type_identifier`，自然不會被收
+/// 進來。帶路徑的型別只取最後一段：`crate::a::Widget` 與 `Widget` 是
+/// 同一個型別。
+const TYPES: TypeShapes = TypeShapes {
+    leaves: &["type_identifier"],
+    scoped: &["scoped_type_identifier"],
+    opaque: &[],
+};
 
 pub struct RustExtractor;
 
@@ -106,14 +116,6 @@ impl Scope {
         Self { container, in_type }
     }
 
-    fn qualify(&self, name: &str) -> String {
-        if self.container.is_empty() {
-            name.to_string()
-        } else {
-            format!("{}::{}", self.container.join("::"), name)
-        }
-    }
-
     /// `self` 在這個位置指的是哪個型別。
     fn self_type(&self) -> Option<&str> {
         if self.in_type {
@@ -130,17 +132,17 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
     for child in node.named_children(&mut cursor) {
         match child.kind() {
             "mod_item" => {
-                let Some(name) = field_text(child, "name", source) else {
+                let Some(name) = common::field_text(child, "name", source) else {
                     continue;
                 };
-                push(child, source, path, scope, Kind::Module, name, out);
+                declare_symbol(child, source, path, scope, Kind::Module, name, out);
                 descend(child, source, path, &scope.child(name, false), out);
             }
             "trait_item" => {
-                let Some(name) = field_text(child, "name", source) else {
+                let Some(name) = common::field_text(child, "name", source) else {
                     continue;
                 };
-                let moniker = push(child, source, path, scope, Kind::Trait, name, out);
+                let moniker = declare_symbol(child, source, path, scope, Kind::Trait, name, out);
                 // 本體裡的方法簽名各自是符號，各自記自己用到的型別。
                 collect_types(child, source, &moniker, Body::Skip, out);
                 descend(child, source, path, &scope.child(name, true), out);
@@ -158,7 +160,7 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
             // 不把本體裡的巢狀函數當成符號，它們無法從外部呼叫，但本體
             // 裡的呼叫仍要記錄下來。
             "function_item" | "function_signature_item" => {
-                let Some(name) = field_text(child, "name", source) else {
+                let Some(name) = common::field_text(child, "name", source) else {
                     continue;
                 };
                 let kind = if scope.in_type {
@@ -166,7 +168,7 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
                 } else {
                     Kind::Function
                 };
-                let moniker = push(child, source, path, scope, kind, name, out);
+                let moniker = declare_symbol(child, source, path, scope, kind, name, out);
                 // 本體裡的型別是區域的實作細節，不算這個函數的對外依賴。
                 collect_types(child, source, &moniker, Body::Skip, out);
                 if let Some(body) = child.child_by_field_name("body") {
@@ -189,6 +191,36 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
             _ => {}
         }
     }
+}
+
+/// 收下一個符號，補上 Rust 特有的限定名與文件註解取法。
+fn declare_symbol(
+    node: Node<'_>,
+    source: &str,
+    path: &str,
+    scope: &Scope,
+    kind: Kind,
+    name: &str,
+    out: &mut FileParse,
+) -> String {
+    common::push(
+        node,
+        path,
+        Declaration {
+            kind,
+            name,
+            container: &scope.container,
+            signature: common::signature(node, source, &["body"], &['=', ':']),
+            docstring: ts::leading_line_comments(
+                node,
+                source,
+                "line_comment",
+                DOC_PREFIXES,
+                DOC_SKIP,
+            ),
+        },
+        out,
+    )
 }
 
 /// 走一條 `use`，把它引入的每個名字記下來。
@@ -307,8 +339,8 @@ fn descend(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut Fi
 }
 
 fn leaf(node: Node<'_>, source: &str, path: &str, scope: &Scope, kind: Kind, out: &mut FileParse) {
-    if let Some(name) = field_text(node, "name", source) {
-        let moniker = push(node, source, path, scope, kind, name, out);
+    if let Some(name) = common::field_text(node, "name", source) {
+        let moniker = declare_symbol(node, source, path, scope, kind, name, out);
         collect_types(node, source, &moniker, Body::Include, out);
     }
 }
@@ -344,7 +376,7 @@ fn collect_types(node: Node<'_>, source: &str, from: &str, body: Body, out: &mut
         if Some(child) == skip_body || Some(child) == own_name {
             continue;
         }
-        gather_types(child, source, &declared, &mut found);
+        common::gather_types(child, source, TYPES, &declared, &mut found);
     }
 
     for (name, line) in found {
@@ -369,7 +401,7 @@ fn collect_implemented_trait(node: Node<'_>, source: &str, from_index: usize, ou
 
     let declared = declared_type_parameters(node, source);
     let mut found: Vec<(String, u32)> = Vec::new();
-    gather_types(implemented, source, &declared, &mut found);
+    common::gather_types(implemented, source, TYPES, &declared, &mut found);
     if found.is_empty() {
         return;
     }
@@ -391,8 +423,8 @@ fn collect_implemented_trait(node: Node<'_>, source: &str, from_index: usize, ou
 }
 
 /// 這個宣告自己引入的泛型參數名。
-fn declared_type_parameters(node: Node<'_>, source: &str) -> HashSet<String> {
-    let mut declared = HashSet::new();
+fn declared_type_parameters(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut declared = Vec::new();
     // 依節點種類而不是欄位名尋找：不同宣告把泛型參數掛在不同的欄位下。
     let mut top = node.walk();
     let Some(parameters) = node
@@ -416,39 +448,10 @@ fn declared_type_parameters(node: Node<'_>, source: &str) -> HashSet<String> {
         if let Some(named) = named
             && named.kind() == "type_identifier"
         {
-            declared.insert(ts::text(named, source).to_string());
+            declared.push(ts::text(named, source).to_string());
         }
     }
     declared
-}
-
-/// 收集節點底下出現的型別名，同一個名字只記第一次出現的位置。
-fn gather_types(
-    node: Node<'_>,
-    source: &str,
-    declared: &HashSet<String>,
-    found: &mut Vec<(String, u32)>,
-) {
-    // `crate::a::Widget` 只記 `Widget`，前面幾段是路徑不是型別。
-    let named = match node.kind() {
-        "type_identifier" => Some(node),
-        "scoped_type_identifier" => node.child_by_field_name("name"),
-        _ => None,
-    };
-
-    if let Some(named) = named {
-        let name = ts::text(named, source);
-        // `Self` 指的是所屬的型別，不是另一個符號。
-        if name != "Self" && !declared.contains(name) && !found.iter().any(|(n, _)| n == name) {
-            found.push((name.to_string(), ts::line_of(named)));
-        }
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        gather_types(child, source, declared, found);
-    }
 }
 
 /// 走遍節點底下所有的呼叫，記到 `from` 名下。
@@ -633,53 +636,6 @@ fn callee_name_of(function: Node<'_>, source: &str, bindings: &Bindings) -> Opti
     }
 }
 
-/// 收下一個符號，回傳它的 moniker。
-fn push(
-    node: Node<'_>,
-    source: &str,
-    path: &str,
-    scope: &Scope,
-    kind: Kind,
-    name: &str,
-    out: &mut FileParse,
-) -> String {
-    let start_line = ts::line_of(node);
-    let qualified = scope.qualify(name);
-    let moniker = moniker::build(path, kind, name, start_line);
-
-    out.symbols.push(RawSymbol {
-        moniker: moniker.clone(),
-        name: name.to_string(),
-        qualified,
-        kind,
-        start_line,
-        end_line: ts::end_line_of(node),
-        signature: signature(node, source),
-        docstring: ts::leading_line_comments(node, source, "line_comment", DOC_PREFIXES, DOC_SKIP),
-    });
-
-    moniker
-}
-
-/// 宣告的簽名，也就是本體之前的部分。
-fn signature(node: Node<'_>, source: &str) -> Option<String> {
-    let full = ts::text(node, source);
-    let cut = node
-        .child_by_field_name("body")
-        .map(|b| b.start_byte() - node.start_byte())
-        .unwrap_or(full.len());
-    let decl = full
-        .get(..cut)?
-        .trim_end()
-        .trim_end_matches(&['=', ':'][..]);
-    let s = ts::collapse_whitespace(decl);
-    if s.is_empty() { None } else { Some(s) }
-}
-
-fn field_text<'a>(node: Node<'_>, field: &str, source: &'a str) -> Option<&'a str> {
-    node.child_by_field_name(field).map(|n| ts::text(n, source))
-}
-
 /// 取得型別運算式的基底名稱。
 ///
 /// `Widget<T>`、`crate::a::Widget`、`&Widget` 指的都是同一個型別。不
@@ -707,6 +663,7 @@ fn type_base_name(node: Node<'_>, source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::RawSymbol;
 
     fn parse(src: &str) -> FileParse {
         RustExtractor.extract("src/a.rs", src)

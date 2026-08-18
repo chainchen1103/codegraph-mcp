@@ -10,8 +10,20 @@ use tree_sitter::{Language, Node};
 
 use super::super::ts;
 use super::super::{Extractor, FileParse, Import, ImportTarget};
+use super::common::{self, Declaration, TypeShapes};
 use crate::extract::moniker;
-use crate::model::{Kind, RawRef, RawSymbol, Rel};
+use crate::model::{Kind, RawRef, Rel};
+
+/// 型別名在 Python 的語法樹裡長什麼樣。
+///
+/// 型別標註就是一般的運算式，因此只收 `identifier`；`int` 這類內建型別
+/// 解析階段查不到，會被判為外部而丟棄。字串形式的前向參考不解析，那需要
+/// 求值才知道指向誰。
+const TYPES: TypeShapes = TypeShapes {
+    leaves: &["identifier"],
+    scoped: &[],
+    opaque: &["string"],
+};
 
 pub struct PythonExtractor;
 
@@ -94,6 +106,30 @@ fn walk(node: Node<'_>, source: &str, path: &str, container: &[String], out: &mu
             _ => {}
         }
     }
+}
+
+/// 收下一個符號，補上 Python 特有的簽名與文件字串取法。
+fn declare_symbol(
+    node: Node<'_>,
+    source: &str,
+    path: &str,
+    container: &[String],
+    kind: Kind,
+    name: &str,
+    out: &mut FileParse,
+) -> String {
+    common::push(
+        node,
+        path,
+        Declaration {
+            kind,
+            name,
+            container,
+            signature: common::signature(node, source, &["body"], &[':']),
+            docstring: docstring(node, source),
+        },
+        out,
+    )
 }
 
 /// 走一條 import，把它引入的每個名字記下來。
@@ -185,16 +221,16 @@ fn dotted_segments(node: Node<'_>, source: &str) -> Vec<String> {
 }
 
 fn class(node: Node<'_>, source: &str, path: &str, container: &[String], out: &mut FileParse) {
-    let Some(name) = field_text(node, "name", source) else {
+    let Some(name) = common::field_text(node, "name", source) else {
         return;
     };
-    let moniker = push(node, source, path, container, Kind::Class, name, out);
+    let moniker = declare_symbol(node, source, path, container, Kind::Class, name, out);
 
     // 基底類別寫在 superclasses 裡，那是這個類別最實在的依賴。
     if let Some(bases) = node.child_by_field_name("superclasses") {
         let mut found = Vec::new();
-        gather_types(bases, source, &mut found);
-        emit_types(&moniker, found, out);
+        common::gather_types(bases, source, TYPES, &[], &mut found);
+        common::emit_types(&moniker, found, out);
     }
 
     let mut nested = container.to_vec();
@@ -205,7 +241,7 @@ fn class(node: Node<'_>, source: &str, path: &str, container: &[String], out: &m
 }
 
 fn function(node: Node<'_>, source: &str, path: &str, container: &[String], out: &mut FileParse) {
-    let Some(name) = field_text(node, "name", source) else {
+    let Some(name) = common::field_text(node, "name", source) else {
         return;
     };
     // 類別底下的是方法，模組層的是函數。
@@ -214,16 +250,16 @@ fn function(node: Node<'_>, source: &str, path: &str, container: &[String], out:
     } else {
         Kind::Method
     };
-    let moniker = push(node, source, path, container, kind, name, out);
+    let moniker = declare_symbol(node, source, path, container, kind, name, out);
 
     // 型別只看標註：參數與回傳。本體裡的是實作細節。
     let mut found = Vec::new();
     for field in ["parameters", "return_type"] {
         if let Some(part) = node.child_by_field_name(field) {
-            gather_types(part, source, &mut found);
+            common::gather_types(part, source, TYPES, &[], &mut found);
         }
     }
-    emit_types(&moniker, found, out);
+    common::emit_types(&moniker, found, out);
 
     if let Some(body) = node.child_by_field_name("body") {
         collect_calls(body, source, &moniker, out);
@@ -265,12 +301,12 @@ fn assignment(node: Node<'_>, source: &str, path: &str, container: &[String], ou
         }
 
         let name = ts::text(left, source);
-        let moniker = push(child, source, path, container, Kind::Const, name, out);
+        let moniker = declare_symbol(child, source, path, container, Kind::Const, name, out);
 
         if let Some(annotation) = child.child_by_field_name("type") {
             let mut found = Vec::new();
-            gather_types(annotation, source, &mut found);
-            emit_types(&moniker, found, out);
+            common::gather_types(annotation, source, TYPES, &[], &mut found);
+            common::emit_types(&moniker, found, out);
         }
         if let Some(value) = child.child_by_field_name("right") {
             collect_calls(value, source, &moniker, out);
@@ -316,84 +352,6 @@ fn callee_name(function: Node<'_>, source: &str) -> Option<String> {
     }
 }
 
-/// 收集節點底下出現的型別名。
-///
-/// Python 的型別標註就是一般的運算式，因此只收 `identifier`；`int` 這
-/// 類內建型別解析階段查不到，會被判為外部而丟棄。
-fn gather_types(node: Node<'_>, source: &str, found: &mut Vec<(String, u32)>) {
-    if node.kind() == "identifier" {
-        let name = ts::text(node, source);
-        if !found.iter().any(|(n, _)| n == name) {
-            found.push((name.to_string(), ts::line_of(node)));
-        }
-        return;
-    }
-    // 字串形式的前向參考（`def f() -> "Box"`）不解析，那需要求值。
-    if node.kind() == "string" {
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        gather_types(child, source, found);
-    }
-}
-
-fn emit_types(from: &str, found: Vec<(String, u32)>, out: &mut FileParse) {
-    for (name, line) in found {
-        out.refs.push(RawRef {
-            from: from.to_string(),
-            name,
-            rel: Rel::UsesType,
-            line,
-        });
-    }
-}
-
-/// 收下一個符號，回傳它的 moniker。
-fn push(
-    node: Node<'_>,
-    source: &str,
-    path: &str,
-    container: &[String],
-    kind: Kind,
-    name: &str,
-    out: &mut FileParse,
-) -> String {
-    let start_line = ts::line_of(node);
-    let qualified = if container.is_empty() {
-        name.to_string()
-    } else {
-        format!("{}::{name}", container.join("::"))
-    };
-    let moniker = moniker::build(path, kind, name, start_line);
-
-    out.symbols.push(RawSymbol {
-        moniker: moniker.clone(),
-        name: name.to_string(),
-        qualified,
-        kind,
-        start_line,
-        end_line: ts::end_line_of(node),
-        signature: signature(node, source),
-        docstring: docstring(node, source),
-    });
-
-    moniker
-}
-
-/// 宣告的簽名，也就是本體之前的部分。
-fn signature(node: Node<'_>, source: &str) -> Option<String> {
-    let full = ts::text(node, source);
-    let cut = node
-        .child_by_field_name("body")
-        .map(|b| b.start_byte() - node.start_byte())
-        .unwrap_or(full.len());
-    let decl = full.get(..cut)?.trim_end().trim_end_matches(':');
-    let s = ts::collapse_whitespace(decl);
-    if s.is_empty() { None } else { Some(s) }
-}
-
 /// 本體裡的第一個字串運算式。
 fn docstring(node: Node<'_>, source: &str) -> Option<String> {
     let body = node.child_by_field_name("body")?;
@@ -417,10 +375,6 @@ fn docstring(node: Node<'_>, source: &str) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
-}
-
-fn field_text<'a>(node: Node<'_>, field: &str, source: &'a str) -> Option<&'a str> {
-    node.child_by_field_name(field).map(|n| ts::text(n, source))
 }
 
 #[cfg(test)]
