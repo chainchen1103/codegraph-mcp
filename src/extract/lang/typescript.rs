@@ -48,24 +48,7 @@ impl Extractor for TypeScriptExtractor {
         } else {
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
         };
-
-        let Some(tree) = ts::parse(&language, source) else {
-            return FileParse {
-                errors: vec![format!("{rel_path}：tree-sitter 無法解析")],
-                ..Default::default()
-            };
-        };
-
-        let mut out = FileParse::default();
-        let root = tree.root_node();
-        if root.has_error() {
-            out.errors
-                .push(format!("{rel_path}：有語法錯誤，結果可能不完整"));
-        }
-
-        let path = moniker::normalize_path(rel_path);
-        walk(root, source, &path, &[], &mut out);
-        out
+        extract_with(&language, rel_path, source)
     }
 
     fn directory_modules(&self) -> &'static [&'static str] {
@@ -77,6 +60,32 @@ impl Extractor for TypeScriptExtractor {
     fn module_path(&self, _rel_path: &str) -> String {
         String::new()
     }
+}
+
+/// 用指定的文法抽取一個 ECMAScript 家族的檔案。
+///
+/// TypeScript 與 JavaScript 的語法樹在這裡用得到的部分是同一套節點——
+/// 函數、類別、方法、箭頭函數綁定、import、呼叫都同名，差別只在
+/// TypeScript 多了型別標註那幾種節點，JavaScript 的樹裡不會出現，對應的
+/// 分支自然不會觸發。因此兩者共用同一個走訪器，而不是抄一份。
+pub(super) fn extract_with(language: &Language, rel_path: &str, source: &str) -> FileParse {
+    let Some(tree) = ts::parse(language, source) else {
+        return FileParse {
+            errors: vec![format!("{rel_path}：tree-sitter 無法解析")],
+            ..Default::default()
+        };
+    };
+
+    let mut out = FileParse::default();
+    let root = tree.root_node();
+    if root.has_error() {
+        out.errors
+            .push(format!("{rel_path}：有語法錯誤，結果可能不完整"));
+    }
+
+    let path = moniker::normalize_path(rel_path);
+    walk(root, source, &path, &[], &mut out);
+    out
 }
 
 /// 走訪一層節點。`container` 是祖先鏈上的名字。

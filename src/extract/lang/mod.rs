@@ -4,6 +4,7 @@
 
 pub mod bindings;
 pub mod common;
+pub mod javascript;
 pub mod python;
 pub mod rust;
 pub mod typescript;
@@ -14,6 +15,7 @@ fn all() -> &'static [&'static dyn super::Extractor] {
         &rust::RustExtractor,
         &typescript::TypeScriptExtractor,
         &python::PythonExtractor,
+        &javascript::JavaScriptExtractor,
     ]
 }
 
@@ -63,6 +65,9 @@ mod tests {
             ("tsx", "typescript"),
             ("py", "python"),
             ("pyi", "python"),
+            ("js", "javascript"),
+            ("jsx", "javascript"),
+            ("mjs", "javascript"),
         ] {
             let found = by_extension(ext).unwrap_or_else(|| panic!("{ext} 沒有抽取器"));
             assert_eq!(found.language(), language, "{ext}");
@@ -71,6 +76,9 @@ mod tests {
 
     #[test]
     fn language_names_are_listed() {
-        assert_eq!(languages(), vec!["rust", "typescript", "python"]);
+        assert_eq!(
+            languages(),
+            vec!["rust", "typescript", "python", "javascript"]
+        );
     }
 }
