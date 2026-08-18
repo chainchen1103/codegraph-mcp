@@ -46,6 +46,13 @@ pub fn tail(name: &str) -> &str {
 pub fn resolve(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> Result<Match> {
     let style = Style::of(ref_name);
 
+    // import 排在最前面：作者明寫了這個名字來自哪個檔案，那是事實，
+    // 其餘每一階都只是推測。
+    match by_import(conn, ref_name, from_file, rel)? {
+        Match::None => {}
+        found => return Ok(found),
+    }
+
     // 沒有寫容器：直接比對名字，同一個檔案優先。
     //
     // 不能先把它當限定名做全域比對：`parse` 在好幾個檔案裡都有，一比
@@ -85,6 +92,52 @@ pub fn resolve(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> R
 
     // 作者已經指明容器，而那個容器不在索引裡，那就是外部的東西。
     Ok(Match::None)
+}
+
+/// 用這個檔案的 import 表比對。
+///
+/// 引用寫成 `utils.greet` 或 `a.b.thing` 時，前面那一段常常正是 import
+/// 進來的名字。查到它指向哪個檔案，就只在那個檔案裡找最後一段——這比
+/// 拿名字去比對全專案準得多，也不必判斷點號到底是模組分隔還是接收者。
+///
+/// 裸名（`greet`）也走這裡：`import { greet } from './u'` 直接指名了它
+/// 來自哪個檔案。
+fn by_import(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> Result<Match> {
+    // 由長到短試前綴：`a.b.thing` 可能是 `a.b` 這個模組裡的 `thing`，
+    // 也可能是 `a` 底下的 `b.thing`。長的比較具體，先試。
+    let separators: &[char] = &['.', ':'];
+    let normalized = ref_name.replace("::", ".");
+    let segments: Vec<&str> = normalized.split(separators).collect();
+
+    for cut in (1..segments.len()).rev() {
+        let prefix = segments[..cut].join(".");
+        let Some(target) = super::imports::source_of(conn, from_file, &prefix)? else {
+            continue;
+        };
+        let name = segments[cut..].join("::");
+        match in_file(conn, &name, target, rel)? {
+            Match::None => continue,
+            found => return Ok(found),
+        }
+    }
+
+    // 整個名字就是 import 進來的那一個。
+    let Some(target) = super::imports::source_of(conn, from_file, ref_name)? else {
+        return Ok(Match::None);
+    };
+    in_file(conn, ref_name, target, rel)
+}
+
+/// 在指定的檔案裡找這個名字，限定名與裸名都比對。
+fn in_file(conn: &Connection, name: &str, file_id: i64, rel: Rel) -> Result<Match> {
+    let sql = format!(
+        "SELECT id FROM symbols
+         WHERE file_id = ?2 AND (qualified = ?1 OR name = ?1 OR qualified LIKE '%::' || ?1){}
+         LIMIT 2",
+        kind_filter(rel, Field::Qualified, Style::Direct)
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    first_or_ambiguous(&mut stmt, rusqlite::params![name, file_id])
 }
 
 /// 由長到短的後綴，只剝掉模組路徑。

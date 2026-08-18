@@ -242,3 +242,113 @@ fn a_mixed_language_repo_keeps_each_language_separate() {
         .unwrap();
     assert_eq!(edges, 3, "每個語言各該有一條 handler → render");
 }
+
+/// Python 的 `a.b.thing()`：點號在解析階段本來代表「對某個值呼叫方法」，
+/// 靠名字比對永遠接不上。import 表指名了 `a.b` 是哪個檔案，就接得上了。
+#[test]
+fn a_dotted_python_call_resolves_through_its_import() {
+    let f = Fixture::indexed(
+        "py-import",
+        &[
+            ("api/util.py", "def thing():\n    return 1\n"),
+            (
+                "api/views.py",
+                "import api.util\n\ndef handler():\n    return api.util.thing()\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    let edges = edge_names(&store);
+    assert_eq!(
+        edges,
+        [("handler".to_string(), "thing".to_string())],
+        "{edges:?}"
+    );
+}
+
+/// TypeScript 的相對 import：`./utils` 要接到同目錄的那個檔案。
+#[test]
+fn a_typescript_call_resolves_through_a_relative_import() {
+    let f = Fixture::indexed(
+        "ts-import",
+        &[
+            ("web/utils.ts", "export function greet(): void {}\n"),
+            (
+                "web/app.ts",
+                "import { greet } from './utils';\nexport function main(): void {\n  greet();\n}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    let edges = edge_names(&store);
+    assert_eq!(
+        edges,
+        [("main".to_string(), "greet".to_string())],
+        "{edges:?}"
+    );
+}
+
+/// 命名空間 import：`helpers.greet()` 的 `helpers` 是整個模組。
+#[test]
+fn a_namespace_import_resolves_its_members() {
+    let f = Fixture::indexed(
+        "ts-namespace",
+        &[
+            ("web/utils.ts", "export function greet(): void {}\n"),
+            (
+                "web/app.ts",
+                "import * as helpers from './utils';\nexport function main(): void {\n  helpers.greet();\n}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    let edges = edge_names(&store);
+    assert_eq!(
+        edges,
+        [("main".to_string(), "greet".to_string())],
+        "{edges:?}"
+    );
+}
+
+/// 專案外部的 import 接不上，那不是錯誤——標準函式庫本來就不在索引裡。
+#[test]
+fn an_external_import_links_to_nothing() {
+    let f = Fixture::indexed(
+        "ts-external",
+        &[(
+            "web/app.ts",
+            "import React from 'react';\nexport function main(): void {}\n",
+        )],
+    );
+    let store = f.store();
+
+    let linked: i64 = store
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM imports WHERE target_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(linked, 0);
+}
+
+/// 邊的兩端名稱。
+fn edge_names(store: &Store) -> Vec<(String, String)> {
+    let mut stmt = store
+        .conn()
+        .prepare(
+            "SELECT a.name, b.name FROM relations r
+             JOIN symbols a ON a.id = r.src
+             JOIN symbols b ON b.id = r.dst
+             ORDER BY a.name, b.name",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}

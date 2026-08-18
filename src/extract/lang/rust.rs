@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use tree_sitter::{Language, Node};
 
 use super::super::ts;
-use super::super::{Extractor, FileParse};
+use super::super::{Extractor, FileParse, Import, ImportTarget};
 use super::bindings::Bindings;
 use crate::extract::moniker;
 use crate::model::{Kind, RawRef, RawSymbol, Rel};
@@ -55,6 +55,10 @@ impl Extractor for RustExtractor {
 
     /// 慣例：`mod.rs`、`lib.rs`、`main.rs` 代表所在目錄本身；`src/` 以外
     /// 的根目錄底下每個檔案自成一個 crate，模組路徑為空。
+    fn directory_modules(&self) -> &'static [&'static str] {
+        &["mod.rs", "lib.rs"]
+    }
+
     fn module_path(&self, rel_path: &str) -> String {
         let normalized = rel_path.replace('\\', "/");
         let mut segments: Vec<&str> = normalized.split('/').collect();
@@ -171,6 +175,11 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
                     collect_calls(body, source, &moniker, &mut bindings, out);
                 }
             }
+            "use_declaration" => {
+                if let Some(argument) = child.child_by_field_name("argument") {
+                    collect_use(argument, source, &[], out);
+                }
+            }
             // 欄位與變體的型別都在本體裡，這幾種要連本體一起看。
             "struct_item" => leaf(child, source, path, scope, Kind::Struct, out),
             "enum_item" => leaf(child, source, path, scope, Kind::Enum, out),
@@ -180,6 +189,114 @@ fn walk(node: Node<'_>, source: &str, path: &str, scope: &Scope, out: &mut FileP
             _ => {}
         }
     }
+}
+
+/// 走一條 `use`，把它引入的每個名字記下來。
+///
+/// `prefix` 是已經走過的模組段。`use a::{b, c::d}` 會分岔成兩條路徑，
+/// 因此要一路把前綴帶下去。
+fn collect_use(node: Node<'_>, source: &str, prefix: &[String], out: &mut FileParse) {
+    match node.kind() {
+        // a::b::Thing
+        "scoped_identifier" => {
+            let mut segments = prefix.to_vec();
+            if let Some(path) = node.child_by_field_name("path") {
+                segments.extend(path_segments(path, source));
+            }
+            if let Some(name) = node.child_by_field_name("name") {
+                let local = ts::text(name, source).to_string();
+                push_import(local, segments, ts::line_of(node), out);
+            }
+        }
+        // a::{b, c}
+        "scoped_use_list" => {
+            let mut segments = prefix.to_vec();
+            if let Some(path) = node.child_by_field_name("path") {
+                segments.extend(path_segments(path, source));
+            }
+            if let Some(list) = node.child_by_field_name("list") {
+                let mut cursor = list.walk();
+                for item in list.named_children(&mut cursor) {
+                    collect_use(item, source, &segments, out);
+                }
+            }
+        }
+        // {b, c} 裡的一項，或整條 `use a::b as c`
+        "use_as_clause" => {
+            let (Some(path), Some(alias)) = (
+                node.child_by_field_name("path"),
+                node.child_by_field_name("alias"),
+            ) else {
+                return;
+            };
+            // `use std::fmt::Write as _` 沒有引入可用的名字。
+            let local = ts::text(alias, source);
+            if local == "_" {
+                return;
+            }
+
+            let mut segments = prefix.to_vec();
+            if let Some(container) = path.child_by_field_name("path") {
+                segments.extend(path_segments(container, source));
+            }
+            push_import(local.to_string(), segments, ts::line_of(node), out);
+        }
+        // {b, c} 裡不帶別名的那幾項
+        "identifier" => {
+            let local = ts::text(node, source).to_string();
+            push_import(local, prefix.to_vec(), ts::line_of(node), out);
+        }
+        // `use a::*` 沒有引入具體的名字，無從記錄。
+        _ => {}
+    }
+}
+
+/// 把模組路徑攤平成一串段。
+fn path_segments(node: Node<'_>, source: &str) -> Vec<String> {
+    match node.kind() {
+        "scoped_identifier" => {
+            let mut out = node
+                .child_by_field_name("path")
+                .map(|p| path_segments(p, source))
+                .unwrap_or_default();
+            if let Some(name) = node.child_by_field_name("name") {
+                out.push(ts::text(name, source).to_string());
+            }
+            out
+        }
+        _ => vec![ts::text(node, source).to_string()],
+    }
+}
+
+/// 把 Rust 的模組路徑翻成與語言無關的目標。
+///
+/// `crate::` 從專案根算起，`super::` 是同一個目錄裡的兄弟模組——當前模
+/// 組就是這個檔案，它的上一層即所在目錄。`self::` 與外部 crate 都無從
+/// 判斷，交給解析階段比對不到之後判為外部。
+fn push_import(local: String, segments: Vec<String>, line: u32, out: &mut FileParse) {
+    let mut segments = segments;
+    let target = match segments.first().map(String::as_str) {
+        Some("crate") => {
+            segments.remove(0);
+            ImportTarget::Rooted(segments)
+        }
+        Some("super") => {
+            segments.remove(0);
+            ImportTarget::Relative(segments.join("/"))
+        }
+        Some("self") => {
+            segments.remove(0);
+            ImportTarget::Relative(segments.join("/"))
+        }
+        Some(_) => ImportTarget::Rooted(segments),
+        None => return,
+    };
+
+    out.imports.push(Import {
+        local,
+        target,
+        line,
+    });
 }
 
 /// 走進容器的本體，沒有本體時不做任何事。
@@ -824,6 +941,97 @@ mod tests {
 
     fn types_of(p: &FileParse, from_name: &str) -> Vec<String> {
         refs_by(p, from_name, Rel::UsesType)
+    }
+
+    fn imports_of(p: &FileParse) -> Vec<(String, ImportTarget)> {
+        p.imports
+            .iter()
+            .map(|i| (i.local.clone(), i.target.clone()))
+            .collect()
+    }
+
+    fn rooted(segments: &[&str]) -> ImportTarget {
+        ImportTarget::Rooted(segments.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_crate_path_import_is_rooted_at_the_project() {
+        let p = parse(
+            "use crate::a::b::Thing;
+",
+        );
+
+        assert_eq!(imports_of(&p), [("Thing".to_string(), rooted(&["a", "b"]))]);
+    }
+
+    /// `super::` 指的是上一層模組，也就是這個檔案所在的目錄。
+    #[test]
+    fn a_super_path_import_is_relative() {
+        let p = parse(
+            "use super::sibling::Thing;
+",
+        );
+
+        assert_eq!(
+            imports_of(&p),
+            [(
+                "Thing".to_string(),
+                ImportTarget::Relative("sibling".to_string())
+            )]
+        );
+    }
+
+    /// 大括號會分岔，每個名字各自成一條 import。
+    #[test]
+    fn a_braced_use_records_every_name_it_binds() {
+        let p = parse(
+            "use crate::a::{One, Two as Alias};
+",
+        );
+
+        assert_eq!(
+            imports_of(&p),
+            [
+                ("One".to_string(), rooted(&["a"])),
+                ("Alias".to_string(), rooted(&["a"])),
+            ]
+        );
+    }
+
+    /// `as _` 沒有引入可用的名字。
+    #[test]
+    fn an_underscore_alias_binds_nothing() {
+        let p = parse(
+            "use std::fmt::Write as _;
+",
+        );
+
+        assert!(p.imports.is_empty(), "{:?}", p.imports);
+    }
+
+    /// 萬用字元沒有指名任何東西，記不下來。
+    #[test]
+    fn a_wildcard_use_records_nothing() {
+        let p = parse(
+            "use crate::a::*;
+",
+        );
+
+        assert!(p.imports.is_empty(), "{:?}", p.imports);
+    }
+
+    /// 外部 crate 與頂層模組長得一樣，一律當成從根算起，解析不到就是外部。
+    #[test]
+    fn a_bare_path_is_rooted_and_may_turn_out_external() {
+        let p = parse(
+            "use serde::Serialize;
+",
+        );
+
+        assert_eq!(
+            imports_of(&p),
+            [("Serialize".to_string(), rooted(&["serde"]))]
+        );
     }
 
     #[test]

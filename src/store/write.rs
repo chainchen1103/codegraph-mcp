@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use super::intern::{Interned, Interner};
 use super::now_millis;
 use crate::error::Result;
-use crate::extract::FileParse;
+use crate::extract::{FileParse, ImportTarget};
 
 /// 短碼的起始長度，以十六進位字元計。
 const HANDLE_LENGTHS: [usize; 6] = [6, 8, 12, 16, 24, 32];
@@ -84,6 +84,7 @@ impl Writer {
         conn.execute_batch(
             "DELETE FROM relations;
              DELETE FROM unresolved_refs;
+             DELETE FROM imports;
              DELETE FROM tombstones;
              DELETE FROM symbols;
              DELETE FROM files;
@@ -178,6 +179,7 @@ impl Writer {
         }
 
         written.refs = self.write_refs(conn, file_id, parse)?;
+        write_imports(conn, file_id, parse)?;
         Ok(written)
     }
 
@@ -301,6 +303,34 @@ fn highest_id(conn: &Connection, table: &str) -> Result<u32> {
         |r| r.get(0),
     )?;
     Ok(highest as u32)
+}
+
+/// 把這個檔案的 import 寫下來。
+///
+/// `target_id` 留空：目標檔案這時候可能還沒被寫進索引，要等整個專案掃
+/// 完才對應得起來。同一個名字在一個檔案裡只會綁到一個東西，重複宣告以
+/// 最後一條為準——那也是語言本身的行為。
+fn write_imports(conn: &Connection, file_id: u32, parse: &FileParse) -> Result<()> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR REPLACE INTO imports(file_id, local, kind, spec, target_id, line)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+    )?;
+
+    for import in &parse.imports {
+        let (kind, spec) = match &import.target {
+            ImportTarget::Relative(path) => (0, path.clone()),
+            ImportTarget::Rooted(segments) => (1, segments.join("/")),
+            ImportTarget::External => (2, String::new()),
+        };
+        stmt.execute(rusqlite::params![
+            file_id,
+            import.local,
+            kind,
+            spec,
+            import.line
+        ])?;
+    }
+    Ok(())
 }
 
 /// 重建全文檢索索引。

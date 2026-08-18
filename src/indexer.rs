@@ -20,6 +20,8 @@ const BATCH_FILES: usize = 500;
 pub struct IndexReport {
     /// 成功寫入的檔案數。
     pub files: usize,
+    /// import 對應到專案內檔案的結果。
+    pub imports: resolve::imports::ImportReport,
     /// 寫入的符號數。
     pub symbols: usize,
     /// 因為 moniker 重複而未寫入的符號數。
@@ -112,6 +114,9 @@ pub fn index_project(project: &Project, store: &mut Store) -> Result<IndexReport
     }
 
     store.with_transaction(rebuild_fts)?;
+    // import 要先接上：它指名了「這個名字來自哪個檔案」，比之後靠名字
+    // 比對可靠，因此必須在解析引用之前就位。
+    report.imports = store.with_transaction(resolve::imports::link)?;
     report.resolve = resolve::resolve_all(store)?;
     store.set_metadata("indexed_at", &crate::store::now_millis().to_string())?;
 

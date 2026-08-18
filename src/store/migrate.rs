@@ -119,6 +119,9 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<()> {
             // 下一次全量索引會填上。
             4 => conn
                 .execute_batch("ALTER TABLE files ADD COLUMN language TEXT NOT NULL DEFAULT '';")?,
+            // 5 到 6：多了 import 表。建表交給後面套用 schema.sql，這裡
+            // 沒有既有物件需要調整。
+            5 => {}
             other => {
                 return Err(CgError::Corrupt {
                     detail: format!("沒有從版本 {other} 升級的路徑"),

@@ -49,6 +49,27 @@ CREATE TABLE IF NOT EXISTS units (
     export_hash TEXT NOT NULL DEFAULT ''
 );
 
+-- 一條 import 在某個檔案裡引入的名字。
+--
+-- 解析階段最強的一階線索：作者明寫了「這個名字來自哪個檔案」，比用名字
+-- 去猜可靠得多。target_id 由解析階段填上，填不出來表示指向專案外部。
+CREATE TABLE IF NOT EXISTS imports (
+    file_id   INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    -- 這個檔案裡看得到的寫法。
+    local     TEXT NOT NULL,
+    -- 目標的種類：0 相對路徑、1 從專案根算起、2 專案外部。
+    kind      INTEGER NOT NULL,
+    -- 目標的原文，種類為外部時是空字串。
+    spec      TEXT NOT NULL,
+    -- 解析出來的目標檔案，還沒解析或指向專案外部時為 NULL。
+    target_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
+    line      INTEGER NOT NULL,
+    PRIMARY KEY (file_id, local)
+) WITHOUT ROWID;
+
+-- 依名字回查是解析階段的熱路徑。
+CREATE INDEX IF NOT EXISTS idx_imports_local ON imports(local);
+
 -- ============================================================
 -- 節點
 -- ============================================================

@@ -9,7 +9,7 @@
 use tree_sitter::{Language, Node};
 
 use super::super::ts;
-use super::super::{Extractor, FileParse};
+use super::super::{Extractor, FileParse, Import, ImportTarget};
 use crate::extract::moniker;
 use crate::model::{Kind, RawRef, RawSymbol, Rel};
 
@@ -43,6 +43,10 @@ impl Extractor for PythonExtractor {
         let path = moniker::normalize_path(rel_path);
         walk(root, source, &path, &[], &mut out);
         out
+    }
+
+    fn directory_modules(&self) -> &'static [&'static str] {
+        &["__init__.py", "__init__.pyi"]
     }
 
     /// 套件路徑，`__init__.py` 代表所在的套件本身。
@@ -84,11 +88,100 @@ fn walk(node: Node<'_>, source: &str, path: &str, container: &[String], out: &mu
         match child.kind() {
             "class_definition" => class(child, source, path, container, out),
             "function_definition" => function(child, source, path, container, out),
+            "import_statement" | "import_from_statement" => collect_import(child, source, out),
             // 模組層與類別層的賦值是常數與欄位，本體裡的區域變數不算。
             "expression_statement" => assignment(child, source, path, container, out),
             _ => {}
         }
     }
+}
+
+/// 走一條 import，把它引入的每個名字記下來。
+///
+/// `import a.b` 引入的名字是 `a.b` 本身——之後會寫成 `a.b.thing()`。
+/// `from a.b import thing` 引入的是 `thing`，目標是 `a.b` 那個檔案。
+fn collect_import(node: Node<'_>, source: &str, out: &mut FileParse) {
+    let line = ts::line_of(node);
+
+    if node.kind() == "import_statement" {
+        let mut cursor = node.walk();
+        for item in node.named_children(&mut cursor) {
+            let (path_node, local) = match item.kind() {
+                "dotted_name" => (item, ts::text(item, source).to_string()),
+                "aliased_import" => {
+                    let (Some(name), Some(alias)) = (
+                        item.child_by_field_name("name"),
+                        item.child_by_field_name("alias"),
+                    ) else {
+                        continue;
+                    };
+                    (name, ts::text(alias, source).to_string())
+                }
+                _ => continue,
+            };
+            let segments = dotted_segments(path_node, source);
+            out.imports.push(Import {
+                local,
+                target: ImportTarget::Rooted(segments),
+                line,
+            });
+        }
+        return;
+    }
+
+    // from <module> import <names>
+    let Some(module) = node.child_by_field_name("module_name") else {
+        return;
+    };
+    let target = module_target(module, source);
+
+    let mut cursor = node.walk();
+    for item in node.named_children(&mut cursor) {
+        if item.id() == module.id() {
+            continue;
+        }
+        let local = match item.kind() {
+            "dotted_name" => ts::text(item, source).to_string(),
+            "aliased_import" => match item.child_by_field_name("alias") {
+                Some(alias) => ts::text(alias, source).to_string(),
+                None => continue,
+            },
+            // `from a import *` 沒有引入具體的名字。
+            _ => continue,
+        };
+        out.imports.push(Import {
+            local,
+            target: target.clone(),
+            line,
+        });
+    }
+}
+
+/// `from` 後面那一段指向哪裡。
+///
+/// 前導的點是套件層級：一個點是所在套件，兩個點是上一層。`from . import
+/// x` 的目標就是這個檔案所在的目錄。
+fn module_target(node: Node<'_>, source: &str) -> ImportTarget {
+    if node.kind() != "relative_import" {
+        return ImportTarget::Rooted(dotted_segments(node, source));
+    }
+
+    let text = ts::text(node, source);
+    let dots = text.len() - text.trim_start_matches('.').len();
+    // 一個點是當前目錄，之後每多一個點往上一層。
+    let up = "../".repeat(dots.saturating_sub(1));
+    let rest = text.trim_start_matches('.').replace('.', "/");
+
+    ImportTarget::Relative(format!("./{up}{rest}"))
+}
+
+/// `a.b.c` 攤平成三段。
+fn dotted_segments(node: Node<'_>, source: &str) -> Vec<String> {
+    ts::text(node, source)
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn class(node: Node<'_>, source: &str, path: &str, container: &[String], out: &mut FileParse) {
@@ -353,6 +446,93 @@ mod tests {
             .filter(|r| r.from == from.moniker && r.rel == rel)
             .map(|r| r.name.clone())
             .collect()
+    }
+
+    fn imports_of(p: &FileParse) -> Vec<(String, ImportTarget)> {
+        p.imports
+            .iter()
+            .map(|i| (i.local.clone(), i.target.clone()))
+            .collect()
+    }
+
+    fn rooted(segments: &[&str]) -> ImportTarget {
+        ImportTarget::Rooted(segments.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// `import a.b` 引入的名字就是 `a.b`，之後會寫成 `a.b.thing()`。
+    #[test]
+    fn a_plain_import_binds_the_dotted_name() {
+        let p = parse(
+            "import a.b
+",
+        );
+
+        assert_eq!(imports_of(&p), [("a.b".to_string(), rooted(&["a", "b"]))]);
+    }
+
+    #[test]
+    fn an_aliased_import_binds_the_alias() {
+        let p = parse(
+            "import a.b as ab
+",
+        );
+
+        assert_eq!(imports_of(&p), [("ab".to_string(), rooted(&["a", "b"]))]);
+    }
+
+    #[test]
+    fn a_from_import_binds_each_name_to_the_module() {
+        let p = parse(
+            "from a.b import thing, other as alias
+",
+        );
+
+        assert_eq!(
+            imports_of(&p),
+            [
+                ("thing".to_string(), rooted(&["a", "b"])),
+                ("alias".to_string(), rooted(&["a", "b"])),
+            ]
+        );
+    }
+
+    /// 一個點是所在套件，多一個點往上一層。
+    #[test]
+    fn relative_imports_count_their_leading_dots() {
+        let one = parse(
+            "from . import sibling
+",
+        );
+        assert_eq!(
+            imports_of(&one),
+            [(
+                "sibling".to_string(),
+                ImportTarget::Relative("./".to_string())
+            )]
+        );
+
+        let two = parse(
+            "from ..pkg import deep
+",
+        );
+        assert_eq!(
+            imports_of(&two),
+            [(
+                "deep".to_string(),
+                ImportTarget::Relative("./../pkg".to_string())
+            )]
+        );
+    }
+
+    /// `from a import *` 沒有指名任何東西。
+    #[test]
+    fn a_star_import_binds_nothing() {
+        let p = parse(
+            "from a import *
+",
+        );
+
+        assert!(p.imports.is_empty(), "{:?}", p.imports);
     }
 
     #[test]
