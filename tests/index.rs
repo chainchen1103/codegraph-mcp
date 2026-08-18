@@ -352,3 +352,83 @@ fn edge_names(store: &Store) -> Vec<(String, String)> {
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
 }
+
+/// JavaScript 與 TypeScript 共用同一套走訪器，import 解析也要一視同仁。
+#[test]
+fn a_javascript_call_resolves_through_a_relative_import() {
+    let f = Fixture::indexed(
+        "js-import",
+        &[
+            ("web/utils.js", "export function greet() {}\n"),
+            (
+                "web/app.js",
+                "import { greet } from './utils';\nexport function main() {\n  greet();\n}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    assert_eq!(
+        edge_names(&store),
+        [("main".to_string(), "greet".to_string())]
+    );
+}
+
+/// 四個語言各自認自己的檔案，邊不跨語言。
+#[test]
+fn four_languages_coexist_without_crossing() {
+    let f = Fixture::indexed(
+        "four-langs",
+        &[
+            (
+                "web/app.ts",
+                "export function handler(): void {\n  render();\n}\nexport function render(): void {}\n",
+            ),
+            (
+                "web/legacy.js",
+                "export function handler() {\n  render();\n}\nexport function render() {}\n",
+            ),
+            (
+                "api/views.py",
+                "def handler():\n    render()\n\ndef render():\n    pass\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn handler() {\n    render();\n}\npub fn render() {}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    let mut languages: Vec<String> = store
+        .conn()
+        .prepare("SELECT DISTINCT language FROM files ORDER BY language")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    languages.sort();
+    assert_eq!(languages, ["javascript", "python", "rust", "typescript"]);
+
+    let crossed: i64 = store
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM relations r
+             JOIN symbols src ON src.id = r.src
+             JOIN symbols dst ON dst.id = r.dst
+             JOIN files sf ON sf.id = src.file_id
+             JOIN files df ON df.id = dst.file_id
+             WHERE sf.language != df.language",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(crossed, 0, "有邊跨過了語言邊界");
+
+    let edges: i64 = store
+        .conn()
+        .query_row("SELECT count(*) FROM relations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(edges, 4, "每個語言各該有一條 handler → render");
+}
