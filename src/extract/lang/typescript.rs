@@ -10,7 +10,7 @@
 use tree_sitter::{Language, Node};
 
 use super::super::ts;
-use super::super::{Extractor, FileParse};
+use super::super::{Extractor, FileParse, Import, ImportTarget};
 use crate::extract::moniker;
 use crate::model::{Kind, RawRef, RawSymbol, Rel};
 
@@ -57,6 +57,10 @@ impl Extractor for TypeScriptExtractor {
         out
     }
 
+    fn directory_modules(&self) -> &'static [&'static str] {
+        &["index.ts", "index.tsx", "index.js"]
+    }
+
     /// TypeScript 沒有由路徑決定的模組樹——import 寫的是相對路徑，不是
     /// 模組名。這一欄留空，跨檔的對應交給解析階段。
     fn module_path(&self, _rel_path: &str) -> String {
@@ -97,6 +101,7 @@ fn walk(node: Node<'_>, source: &str, path: &str, container: &[String], out: &mu
             "method_definition" | "method_signature" | "abstract_method_signature" => {
                 function(child, source, path, container, Kind::Method, out);
             }
+            "import_statement" => collect_import(child, source, out),
             // `const twice = (n) => ...` 是函數，`const LIMIT = 10` 不是。
             "lexical_declaration" | "variable_declaration" => {
                 let mut inner = child.walk();
@@ -109,6 +114,93 @@ fn walk(node: Node<'_>, source: &str, path: &str, container: &[String], out: &mu
             _ => {}
         }
     }
+}
+
+/// 走一條 `import`，把它引入的每個名字記下來。
+fn collect_import(node: Node<'_>, source: &str, out: &mut FileParse) {
+    let Some(source_node) = node.child_by_field_name("source") else {
+        return;
+    };
+    // 字串節點含引號，內容在 string_fragment 裡。
+    let specifier = source_node
+        .named_child(0)
+        .map(|n| ts::text(n, source))
+        .unwrap_or_else(|| ts::text(source_node, source).trim_matches(['\'', '"']));
+
+    let target = classify(specifier);
+    let line = ts::line_of(node);
+
+    let mut cursor = node.walk();
+    for clause in node.named_children(&mut cursor) {
+        if clause.kind() != "import_clause" {
+            continue;
+        }
+        let mut inner = clause.walk();
+        for part in clause.named_children(&mut inner) {
+            match part.kind() {
+                // import Default from '...'
+                "identifier" => push_import(ts::text(part, source), &target, line, out),
+                // import * as ns from '...'
+                "namespace_import" => {
+                    if let Some(name) = part.named_child(0) {
+                        push_import(ts::text(name, source), &target, line, out);
+                    }
+                }
+                // import { a, b as c } from '...'
+                "named_imports" => {
+                    let mut items = part.walk();
+                    for item in part.named_children(&mut items) {
+                        if item.kind() != "import_specifier" {
+                            continue;
+                        }
+                        let bound = item
+                            .child_by_field_name("alias")
+                            .or_else(|| item.child_by_field_name("name"));
+                        if let Some(bound) = bound {
+                            push_import(ts::text(bound, source), &target, line, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// import 的字串指向哪裡。
+///
+/// 以 `.` 開頭的是相對路徑。其餘的裸模組名（`react`、`@scope/pkg`）是
+/// 套件，不在這個專案裡；路徑別名（`@/utils`、`~/lib`）留給解析階段當成
+/// 從根算起的路徑試一次，試不到自然落成外部。
+fn classify(specifier: &str) -> ImportTarget {
+    if specifier.starts_with('.') {
+        return ImportTarget::Relative(specifier.to_string());
+    }
+
+    let rooted = specifier.trim_start_matches(['@', '~', '/']);
+    if specifier.starts_with('@') && !specifier.starts_with("@/") {
+        // `@scope/package` 是 npm 的命名空間套件，不是路徑別名。
+        return ImportTarget::External;
+    }
+    if specifier.starts_with('@') || specifier.starts_with('~') || specifier.starts_with('/') {
+        return ImportTarget::Rooted(
+            rooted
+                .trim_start_matches('/')
+                .split('/')
+                .map(str::to_string)
+                .collect(),
+        );
+    }
+
+    ImportTarget::External
+}
+
+fn push_import(local: &str, target: &ImportTarget, line: u32, out: &mut FileParse) {
+    out.imports.push(Import {
+        local: local.to_string(),
+        target: target.clone(),
+        line,
+    });
 }
 
 /// 有本體、內部還有其他宣告的容器。
@@ -390,6 +482,87 @@ mod tests {
             .filter(|r| r.from == from.moniker && r.rel == rel)
             .map(|r| r.name.clone())
             .collect()
+    }
+
+    fn imports_of(p: &FileParse) -> Vec<(String, ImportTarget)> {
+        p.imports
+            .iter()
+            .map(|i| (i.local.clone(), i.target.clone()))
+            .collect()
+    }
+
+    fn relative(spec: &str) -> ImportTarget {
+        ImportTarget::Relative(spec.to_string())
+    }
+
+    #[test]
+    fn named_imports_bind_every_name_they_list() {
+        let p = parse(
+            "import { greet, other as alias } from './utils';
+",
+        );
+
+        assert_eq!(
+            imports_of(&p),
+            [
+                ("greet".to_string(), relative("./utils")),
+                ("alias".to_string(), relative("./utils")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_namespace_import_binds_the_namespace_name() {
+        let p = parse(
+            "import * as helpers from '../lib/h';
+",
+        );
+
+        assert_eq!(
+            imports_of(&p),
+            [("helpers".to_string(), relative("../lib/h"))]
+        );
+    }
+
+    #[test]
+    fn a_default_import_binds_its_local_name() {
+        let p = parse(
+            "import Thing from './thing';
+",
+        );
+
+        assert_eq!(imports_of(&p), [("Thing".to_string(), relative("./thing"))]);
+    }
+
+    /// 裸模組名是 npm 套件，不在這個專案裡。
+    #[test]
+    fn a_bare_specifier_is_external() {
+        let p = parse(
+            "import React from 'react';
+import { z } from '@scope/pkg';
+",
+        );
+
+        for (_, target) in imports_of(&p) {
+            assert_eq!(target, ImportTarget::External);
+        }
+    }
+
+    /// 路徑別名當成從根算起，解析不到就落成外部。
+    #[test]
+    fn a_path_alias_is_rooted() {
+        let p = parse(
+            "import { a } from '@/utils/fmt';
+",
+        );
+
+        assert_eq!(
+            imports_of(&p),
+            [(
+                "a".to_string(),
+                ImportTarget::Rooted(vec!["utils".to_string(), "fmt".to_string()])
+            )]
+        );
     }
 
     #[test]

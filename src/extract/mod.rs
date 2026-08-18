@@ -11,11 +11,39 @@ use std::path::Path;
 
 use crate::model::{RawRef, RawSymbol};
 
+/// import 指向的位置，翻成與語言無關的形式。
+///
+/// 每個語言的 import 語法都不同，但問的是同一件事：**這個名字是從哪個
+/// 檔案來的**。抽取器負責把自己語言的寫法翻成這三種之一，解析階段就只
+/// 需要做與語言無關的路徑比對。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportTarget {
+    /// 相對於發出 import 的那個檔案。TypeScript 的 `./utils`。
+    Relative(String),
+    /// 相對於專案根目錄的路徑段。Python 的 `a.b`、Rust 的 `crate::a::b`。
+    Rooted(Vec<String>),
+    /// 專案外部，不必再找。標準函式庫與第三方套件都算。
+    External,
+}
+
+/// 一條 import 在這個檔案裡引入的名字。
+///
+/// `local` 是這個檔案裡看得到的寫法。`import * as utils from './u'` 的
+/// `local` 是 `utils`，`from a.b import thing` 的是 `thing`。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Import {
+    pub local: String,
+    pub target: ImportTarget,
+    pub line: u32,
+}
+
 /// 單一檔案的抽取結果。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FileParse {
     pub symbols: Vec<RawSymbol>,
     pub refs: Vec<RawRef>,
+    /// 這個檔案 import 了什麼。解析階段最強的一階線索。
+    pub imports: Vec<Import>,
     /// 語法錯誤等非致命問題。有錯誤時仍會回傳已抽到的符號。
     pub errors: Vec<String>,
 }
@@ -50,6 +78,14 @@ pub trait Extractor: Send + Sync {
     /// Rust 的 `mod.rs` 代表所在目錄，Python 的是 `__init__.py`，
     /// TypeScript 根本不用這種形式。沒有這一層的語言回空字串。
     fn module_path(&self, rel_path: &str) -> String;
+
+    /// import 指向一個目錄時，代表那個目錄的檔名。
+    ///
+    /// `./components` 指的是 `components/index.ts`，`import a.b` 指的可能
+    /// 是 `a/b/__init__.py`。沒有這種慣例的語言回空陣列。
+    fn directory_modules(&self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 /// 依副檔名取得抽取器，不支援的副檔名回 `None`。

@@ -170,6 +170,8 @@ fn sync_one(
 
         // 這個檔案新提供的名字，可能正是別處等著的那一個。
         let names: Vec<String> = parse.symbols.iter().map(|s| s.name.clone()).collect();
+        // 這個檔案的 import 剛換過一批，先接上再解析引用。
+        resolve::imports::link(conn)?;
         let requeued = resolve::requeue_by_names(conn, &names)?;
         // 這條路徑只寫了一個檔案，索引裡查不到的名字可能只是還沒輪到。
         let resolved = resolve::resolve_pending(conn, resolve::Unknown::Keep)?.resolved;
@@ -233,6 +235,9 @@ fn clear_file(conn: &Connection, rel_path: &str) -> Result<()> {
         [file_id],
     )?;
     conn.execute("DELETE FROM unresolved_refs WHERE file_id = ?1", [file_id])?;
+    // 這個檔案的 import 隨著重新解析整批換掉；別的檔案指向它的那些
+    // （target_id）留著，它們的目標仍然是同一個檔案。
+    conn.execute("DELETE FROM imports WHERE file_id = ?1", [file_id])?;
     conn.execute("DELETE FROM symbols WHERE file_id = ?1", [file_id])?;
     Ok(())
 }
