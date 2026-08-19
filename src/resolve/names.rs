@@ -44,7 +44,7 @@ pub fn tail(name: &str) -> &str {
 /// 4. 全部落空表示那個容器不屬於這個專案，例如 `Vec::new`。判為外部，
 ///    不再退回去比對名字。
 pub fn resolve(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> Result<Match> {
-    let style = Style::of(ref_name);
+    let style = Style::of(ref_name, has_implicit_receiver(conn, from_file)?);
 
     // import 排在最前面：作者明寫了這個名字來自哪個檔案，那是事實，
     // 其餘每一階都只是推測。
@@ -140,6 +140,20 @@ fn in_file(conn: &Connection, name: &str, file_id: i64, rel: Rel) -> Result<Matc
     first_or_ambiguous(&mut stmt, rusqlite::params![name, file_id])
 }
 
+/// 這個檔案的語言在型別內部可不可以省略接收者。
+///
+/// 屬於語言的性質，因此答案來自該語言的抽取器，不寫死在解析層。
+fn has_implicit_receiver(conn: &Connection, file_id: i64) -> Result<bool> {
+    let mut stmt = conn.prepare_cached("SELECT language FROM files WHERE id = ?1")?;
+    let mut rows = stmt.query([file_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(false);
+    };
+    let language: String = row.get(0)?;
+
+    Ok(crate::extract::lang::by_language(&language).is_some_and(|e| e.implicit_receiver()))
+}
+
 /// 由長到短的後綴，只剝掉模組路徑。
 ///
 /// 要剝的是 import 層級的差異：`crate::store::Store::open` 與
@@ -201,20 +215,30 @@ fn by_module(conn: &Connection, ref_name: &str, rel: Rel, style: Style) -> Resul
 /// 呼叫的寫法。
 ///
 /// 只靠名字無從得知接收者的型別，但寫法本身已經排除了一部分候選：
-/// `warnings.push(..)` 不可能落在專案裡的自由函數 `push` 上，
-/// `helper()` 也不會是某個型別的方法。
+/// `warnings.push(..)` 不可能落在專案裡的自由函數 `push` 上。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Style {
-    /// `foo()` 或 `a::b::foo()`。
+    /// `foo()` 或 `a::b::foo()`，而且這個語言的裸名不可能是方法。
+    ///
+    /// Rust 的 `helper()`、Python 的 `helper()` 都必須寫出接收者才能呼叫
+    /// 方法，因此裸名一定不是方法。
     Direct,
+    /// `foo()`，但這個語言有隱含的接收者。
+    ///
+    /// Java、Kotlin、Scala 在類別內部寫 `render()` 就是 `this.render()`，
+    /// 方法是完全合理的候選，不能排除。
+    Member,
     /// `receiver.method()`。
     Receiver,
 }
 
 impl Style {
-    fn of(ref_name: &str) -> Self {
+    /// `implicit_receiver` 表示這個語言在型別內部可以省略接收者。
+    fn of(ref_name: &str, implicit_receiver: bool) -> Self {
         if ref_name.contains('.') {
             Style::Receiver
+        } else if implicit_receiver {
+            Style::Member
         } else {
             Style::Direct
         }
@@ -375,6 +399,8 @@ fn kind_filter(rel: Rel, field: Field, style: Style) -> &'static str {
         Rel::Calls => match (field, style) {
             (Field::Qualified, _) => base_clause(),
             (Field::Name, Style::Direct) => direct_clause(),
+            // 有隱含接收者的語言，裸名可能是同一個型別的方法。
+            (Field::Name, Style::Member) => base_clause(),
             (Field::Name, Style::Receiver) => receiver_clause(),
         },
         // 型別的位置上只可能站著型別。專案裡到處都有跟型別同名的建構
@@ -788,9 +814,23 @@ mod tests {
 
     #[test]
     fn the_call_style_comes_from_the_written_form() {
-        assert_eq!(Style::of("helper"), Style::Direct);
-        assert_eq!(Style::of("a::b::helper"), Style::Direct);
-        assert_eq!(Style::of("obj.helper"), Style::Receiver);
-        assert_eq!(Style::of("self.inner.helper"), Style::Receiver);
+        assert_eq!(Style::of("helper", false), Style::Direct);
+        assert_eq!(Style::of("a::b::helper", false), Style::Direct);
+        assert_eq!(Style::of("obj.helper", false), Style::Receiver);
+        assert_eq!(Style::of("self.inner.helper", false), Style::Receiver);
+    }
+
+    /// 有隱含接收者的語言，裸名可能是同一個型別的方法。
+    #[test]
+    fn an_implicit_receiver_language_keeps_methods_as_candidates() {
+        assert_eq!(Style::of("render", true), Style::Member);
+        // 寫出接收者時，有沒有隱含接收者都不影響判斷。
+        assert_eq!(Style::of("obj.render", true), Style::Receiver);
+
+        let clause = kind_filter(Rel::Calls, Field::Name, Style::Member);
+        assert!(
+            !clause.contains(&(Kind::Method as u8).to_string()),
+            "{clause}"
+        );
     }
 }

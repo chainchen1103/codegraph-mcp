@@ -509,3 +509,115 @@ fn a_go_method_is_reachable_by_its_receiver_type() {
         "{qualified:?}"
     );
 }
+
+/// Java 的靜態呼叫要接到 import 指名的那個檔案。
+#[test]
+fn a_java_static_call_resolves_through_its_import() {
+    let f = Fixture::indexed(
+        "java-import",
+        &[
+            (
+                "src/main/java/com/example/util/Helper.java",
+                "package com.example.util;\npublic class Helper {\n    public static int compute() { return 1; }\n}\n",
+            ),
+            (
+                "src/main/java/com/example/app/Box.java",
+                "package com.example.app;\nimport com.example.util.Helper;\n\
+                 public class Box {\n    public int run() { return Helper.compute(); }\n}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    assert_eq!(
+        edge_names(&store),
+        [("run".to_string(), "compute".to_string())]
+    );
+}
+
+/// 八個語言各自認自己的檔案，邊不跨語言。
+#[test]
+fn eight_languages_coexist_without_crossing() {
+    let f = Fixture::indexed(
+        "eight-langs",
+        &[
+            (
+                "web/app.ts",
+                "export function handler(): void {\n  render();\n}\nexport function render(): void {}\n",
+            ),
+            (
+                "web/legacy.js",
+                "export function handler() {\n  render();\n}\nexport function render() {}\n",
+            ),
+            (
+                "api/views.py",
+                "def handler():\n    render()\n\ndef render():\n    pass\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn handler() {\n    render();\n}\npub fn render() {}\n",
+            ),
+            (
+                "svc/handler.go",
+                "package svc\n\nfunc Handler() {\n\tRender()\n}\n\nfunc Render() {}\n",
+            ),
+            (
+                "src/main/java/com/example/App.java",
+                "package com.example;\npublic class App {\n    void handler() { render(); }\n    void render() {}\n}\n",
+            ),
+            (
+                "src/main/scala/com/example/App.scala",
+                "package com.example\nobject App {\n  def handler(): Unit = { render() }\n  def render(): Unit = {}\n}\n",
+            ),
+            (
+                "src/main/kotlin/com/example/App.kt",
+                "package com.example\nfun handler() {\n    render()\n}\nfun render() {}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    let mut languages: Vec<String> = store
+        .conn()
+        .prepare("SELECT DISTINCT language FROM files ORDER BY language")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    languages.sort();
+    assert_eq!(
+        languages,
+        [
+            "go",
+            "java",
+            "javascript",
+            "kotlin",
+            "python",
+            "rust",
+            "scala",
+            "typescript"
+        ]
+    );
+
+    let crossed: i64 = store
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM relations r
+             JOIN symbols src ON src.id = r.src
+             JOIN symbols dst ON dst.id = r.dst
+             JOIN files sf ON sf.id = src.file_id
+             JOIN files df ON df.id = dst.file_id
+             WHERE sf.language != df.language",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(crossed, 0, "有邊跨過了語言邊界");
+
+    let edges: i64 = store
+        .conn()
+        .query_row("SELECT count(*) FROM relations", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(edges, 8, "每個語言各該有一條 handler → render");
+}
