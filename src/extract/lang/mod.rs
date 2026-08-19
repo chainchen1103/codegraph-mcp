@@ -4,6 +4,7 @@
 
 pub mod bindings;
 pub mod common;
+pub mod go;
 pub mod javascript;
 pub mod python;
 pub mod rust;
@@ -16,6 +17,7 @@ fn all() -> &'static [&'static dyn super::Extractor] {
         &typescript::TypeScriptExtractor,
         &python::PythonExtractor,
         &javascript::JavaScriptExtractor,
+        &go::GoExtractor,
     ]
 }
 
@@ -53,7 +55,7 @@ mod tests {
     fn lookup_is_by_bare_extension() {
         assert!(by_extension("rs").is_some());
         assert!(by_extension(".rs").is_none(), "副檔名不應該帶點");
-        assert!(by_extension("go").is_none(), "還沒註冊的語言不該有抽取器");
+        assert!(by_extension("java").is_none(), "還沒註冊的語言不該有抽取器");
     }
 
     /// 每個語言各認自己的副檔名，查得到對的那一個。
@@ -68,6 +70,7 @@ mod tests {
             ("js", "javascript"),
             ("jsx", "javascript"),
             ("mjs", "javascript"),
+            ("go", "go"),
         ] {
             let found = by_extension(ext).unwrap_or_else(|| panic!("{ext} 沒有抽取器"));
             assert_eq!(found.language(), language, "{ext}");
@@ -78,7 +81,7 @@ mod tests {
     fn language_names_are_listed() {
         assert_eq!(
             languages(),
-            vec!["rust", "typescript", "python", "javascript"]
+            vec!["rust", "typescript", "python", "javascript", "go"]
         );
     }
 }
