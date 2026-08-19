@@ -432,3 +432,80 @@ fn four_languages_coexist_without_crossing() {
         .unwrap();
     assert_eq!(edges, 4, "每個語言各該有一條 handler → render");
 }
+
+/// Go 的套件是目錄，`util.Thing()` 要接到 `pkg/util/` 底下的符號。
+///
+/// 這條走的不是 import 表（那是「名字對一個檔案」，對不上 Go 的模型），
+/// 而是模組路徑：抽取階段把呼叫改寫成 `util::Thing`，解析階段拿它比對
+/// `files.module_path`。
+#[test]
+fn a_go_package_qualified_call_resolves_across_directories() {
+    let f = Fixture::indexed(
+        "go-package",
+        &[
+            (
+                "pkg/util/helpers.go",
+                "package util\n\nfunc Thing() int {\n\treturn 1\n}\n",
+            ),
+            (
+                "cmd/app/main.go",
+                "package main\n\nimport \"example.com/m/pkg/util\"\n\nfunc Run() int {\n\treturn util.Thing()\n}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    assert_eq!(
+        edge_names(&store),
+        [("Run".to_string(), "Thing".to_string())]
+    );
+}
+
+/// 同一個套件裡的呼叫不寫套件名，靠同檔／同目錄的比對就該接上。
+#[test]
+fn a_go_call_within_one_package_resolves() {
+    let f = Fixture::indexed(
+        "go-samepkg",
+        &[
+            ("pkg/util/a.go", "package util\n\nfunc Helper() {}\n"),
+            (
+                "pkg/util/b.go",
+                "package util\n\nfunc Caller() {\n\tHelper()\n}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    assert_eq!(
+        edge_names(&store),
+        [("Caller".to_string(), "Helper".to_string())]
+    );
+}
+
+/// 方法掛在接收者型別名下，跨檔仍找得到。
+#[test]
+fn a_go_method_is_reachable_by_its_receiver_type() {
+    let f = Fixture::indexed(
+        "go-method",
+        &[(
+            "pkg/box/box.go",
+            "package box\n\ntype Box struct {\n\tW int\n}\n\n\
+             func (b *Box) Area() int {\n\treturn b.W\n}\n\n\
+             func Make() int {\n\tb := Box{}\n\treturn b.Area()\n}\n",
+        )],
+    );
+    let store = f.store();
+
+    let qualified: Vec<String> = store
+        .conn()
+        .prepare("SELECT qualified FROM symbols ORDER BY qualified")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        qualified.contains(&"Box::Area".to_string()),
+        "{qualified:?}"
+    );
+}
