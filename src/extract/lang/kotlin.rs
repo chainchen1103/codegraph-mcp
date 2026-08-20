@@ -242,7 +242,10 @@ fn push(
             kind,
             name,
             container,
-            signature: common::signature(node, source, &["body"], &['=']),
+            // 本體是 function_body 子節點而不是名為 body 的欄位，共用的
+            // 欄位版判斷在這裡永遠落空。
+            signature: signature(node, source),
+            has_body: body_of(node).is_some(),
             docstring: ts::leading_line_comments(
                 node,
                 source,
@@ -253,6 +256,25 @@ fn push(
         },
         out,
     )
+}
+
+/// 這個宣告的本體，沒有就是純宣告（抽象方法、interface 的方法）。
+fn body_of<'a>(node: Node<'a>) -> Option<Node<'a>> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|c| matches!(c.kind(), "function_body" | "class_body" | "enum_class_body"))
+}
+
+/// 宣告的簽名，也就是本體之前的部分。
+fn signature(node: Node<'_>, source: &str) -> Option<String> {
+    let full = ts::text(node, source);
+    let cut = body_of(node)
+        .map(|b| b.start_byte() - node.start_byte())
+        .unwrap_or(full.len());
+
+    let decl = full.get(..cut)?.trim_end().trim_end_matches('=');
+    let s = ts::collapse_whitespace(decl);
+    if s.is_empty() { None } else { Some(s) }
 }
 
 /// 收集節點底下 `user_type` 指到的型別名。

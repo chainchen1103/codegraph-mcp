@@ -155,6 +155,7 @@ fn declare_symbol(
             container,
             // 箭頭函數的本體掛在 value 底下，不是 body。
             signature: common::signature(node, source, &["body", "value"], &['=', ':']),
+            has_body: common::has_body(node, &["body", "value"]),
             docstring: ts::leading_line_comments(node, source, "comment", DOC_PREFIXES, DOC_SKIP),
         },
         out,

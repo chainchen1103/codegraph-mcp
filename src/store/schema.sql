@@ -85,7 +85,10 @@ CREATE TABLE IF NOT EXISTS symbols (
     start_line INTEGER NOT NULL,
     end_line   INTEGER NOT NULL,
     signature  TEXT,
-    docstring  TEXT
+    docstring  TEXT,
+    -- 這個宣告有沒有本體。只有宣告沒有本體的（C/C++ 的 header、interface
+    -- 的方法、抽象方法）與別處那個定義是同一件東西的兩面。
+    has_body   INTEGER NOT NULL DEFAULT 1
 );
 
 -- ============================================================

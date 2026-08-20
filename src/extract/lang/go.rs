@@ -314,6 +314,7 @@ fn declare(
             name,
             container,
             signature: common::signature(node, source, &["body"], &[]),
+            has_body: common::has_body(node, &["body"]),
             docstring: ts::leading_line_comments(node, source, "comment", DOC_PREFIXES, DOC_SKIP),
         },
         out,
