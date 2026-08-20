@@ -86,6 +86,15 @@ pub trait Extractor: Send + Sync {
     fn directory_modules(&self) -> &'static [&'static str] {
         &[]
     }
+
+    /// 在型別內部可不可以省略接收者。
+    ///
+    /// Java、Kotlin、Scala 在類別裡寫 `render()` 就是 `this.render()`，
+    /// 方法是合理的候選。Rust、Python、Go 都必須寫出接收者，裸名一定不
+    /// 是方法——解析階段靠這個差別決定要不要把方法排除在候選之外。
+    fn implicit_receiver(&self) -> bool {
+        false
+    }
 }
 
 /// 依副檔名取得抽取器，不支援的副檔名回 `None`。

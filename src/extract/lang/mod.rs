@@ -5,9 +5,13 @@
 pub mod bindings;
 pub mod common;
 pub mod go;
+pub mod java;
 pub mod javascript;
+pub mod jvm;
+pub mod kotlin;
 pub mod python;
 pub mod rust;
+pub mod scala;
 pub mod typescript;
 
 /// 所有已註冊的抽取器。
@@ -18,6 +22,9 @@ fn all() -> &'static [&'static dyn super::Extractor] {
         &python::PythonExtractor,
         &javascript::JavaScriptExtractor,
         &go::GoExtractor,
+        &java::JavaExtractor,
+        &scala::ScalaExtractor,
+        &kotlin::KotlinExtractor,
     ]
 }
 
@@ -27,6 +34,11 @@ pub fn by_extension(ext: &str) -> Option<&'static dyn super::Extractor> {
         .iter()
         .copied()
         .find(|e| e.extensions().contains(&ext))
+}
+
+/// 依語言名稱取得抽取器。
+pub fn by_language(name: &str) -> Option<&'static dyn super::Extractor> {
+    all().iter().copied().find(|e| e.language() == name)
 }
 
 /// 已支援的語言名稱。
@@ -55,7 +67,7 @@ mod tests {
     fn lookup_is_by_bare_extension() {
         assert!(by_extension("rs").is_some());
         assert!(by_extension(".rs").is_none(), "副檔名不應該帶點");
-        assert!(by_extension("java").is_none(), "還沒註冊的語言不該有抽取器");
+        assert!(by_extension("php").is_none(), "還沒註冊的語言不該有抽取器");
     }
 
     /// 每個語言各認自己的副檔名，查得到對的那一個。
@@ -71,6 +83,10 @@ mod tests {
             ("jsx", "javascript"),
             ("mjs", "javascript"),
             ("go", "go"),
+            ("java", "java"),
+            ("scala", "scala"),
+            ("kt", "kotlin"),
+            ("kts", "kotlin"),
         ] {
             let found = by_extension(ext).unwrap_or_else(|| panic!("{ext} 沒有抽取器"));
             assert_eq!(found.language(), language, "{ext}");
@@ -81,7 +97,16 @@ mod tests {
     fn language_names_are_listed() {
         assert_eq!(
             languages(),
-            vec!["rust", "typescript", "python", "javascript", "go"]
+            vec![
+                "rust",
+                "typescript",
+                "python",
+                "javascript",
+                "go",
+                "java",
+                "scala",
+                "kotlin",
+            ]
         );
     }
 }
