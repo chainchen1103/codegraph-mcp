@@ -155,8 +155,8 @@ impl Writer {
 
         let mut written = FileWritten::default();
         let mut stmt = conn.prepare_cached(
-            "INSERT OR IGNORE INTO symbols(id, name, qualified, kind, file_id, start_line, end_line, signature, docstring)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR IGNORE INTO symbols(id, name, qualified, kind, file_id, start_line, end_line, signature, docstring, has_body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
 
         for (symbol, id) in parse.symbols.iter().zip(ids) {
@@ -170,6 +170,7 @@ impl Writer {
                 symbol.end_line,
                 symbol.signature,
                 symbol.docstring,
+                symbol.has_body as i64,
             ])?;
             if rows == 0 {
                 written.skipped += 1;
@@ -371,6 +372,7 @@ mod tests {
             end_line: line + 1,
             signature: Some(format!("fn {name}()")),
             docstring: None,
+            has_body: true,
         }
     }
 

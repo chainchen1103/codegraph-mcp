@@ -126,6 +126,7 @@ fn declare_symbol(
             name,
             container,
             signature: common::signature(node, source, &["body"], &[':']),
+            has_body: common::has_body(node, &["body"]),
             docstring: docstring(node, source),
         },
         out,

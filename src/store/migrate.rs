@@ -122,6 +122,11 @@ fn apply_migrations(conn: &Connection, from: i64) -> Result<()> {
             // 5 到 6：多了 import 表。建表交給後面套用 schema.sql，這裡
             // 沒有既有物件需要調整。
             5 => {}
+            // 6 到 7：符號記下自己有沒有本體。舊的列預設為真，下一次
+            // 全量索引才分得出宣告與定義。
+            6 => conn.execute_batch(
+                "ALTER TABLE symbols ADD COLUMN has_body INTEGER NOT NULL DEFAULT 1;",
+            )?,
             other => {
                 return Err(CgError::Corrupt {
                     detail: format!("沒有從版本 {other} 升級的路徑"),
@@ -285,11 +290,13 @@ mod tests {
     fn upgrading_from_v3_widens_the_retry_index() {
         let conn = mem();
         conn.execute_batch(SCHEMA).unwrap();
-        // 回推成 v3 當時的形狀：舊的部分索引條件，而且還沒有 language 欄位。
+        // 回推成 v3 當時的形狀：舊的部分索引條件，而且還沒有 language 與
+        // has_body 兩個後來才加的欄位。
         conn.execute_batch(
             "DROP INDEX IF EXISTS idx_unresolved_tail;
              CREATE INDEX idx_unresolved_tail ON unresolved_refs(name_tail) WHERE status = 1;
              ALTER TABLE files DROP COLUMN language;
+             ALTER TABLE symbols DROP COLUMN has_body;
              INSERT INTO schema_versions(version, applied_at, note) VALUES (3, 0, 'v3');",
         )
         .unwrap();

@@ -282,3 +282,73 @@ fn collecting_from_a_missing_directory_is_harmless() {
     collect(&PathBuf::from("這個目錄不存在-codegraph"), &mut out);
     assert!(out.is_empty());
 }
+
+/// 只有宣告沒有本體的符號，各語言都要判斷得出來。
+///
+/// C/C++ 的 header、interface 的方法、抽象方法都靠這一欄才分得出誰是宣告、
+/// 誰是定義。
+#[test]
+fn declarations_without_bodies_are_marked_across_languages() {
+    let cases: &[(&str, &str, &str, bool)] = &[
+        (
+            "src/a.rs",
+            "pub trait T {\n    fn run(&self);\n}\n",
+            "run",
+            false,
+        ),
+        ("src/a.rs", "pub fn run() {}\n", "run", true),
+        (
+            "web/a.ts",
+            "interface S {\n  run(): void;\n}\n",
+            "run",
+            false,
+        ),
+        ("web/a.ts", "export function run(): void {}\n", "run", true),
+        (
+            "src/main/java/A.java",
+            "interface S {\n    void run();\n}\n",
+            "run",
+            false,
+        ),
+        (
+            "src/main/java/A.java",
+            "class C {\n    void run() {}\n}\n",
+            "run",
+            true,
+        ),
+        (
+            "src/main/scala/A.scala",
+            "trait S {\n  def run: Int\n}\n",
+            "run",
+            false,
+        ),
+        (
+            "src/main/kotlin/A.kt",
+            "interface S {\n    fun run(): Int\n}\n",
+            "run",
+            false,
+        ),
+        ("src/main/kotlin/A.kt", "fun run() {}\n", "run", true),
+        (
+            "pkg/a.go",
+            "package pkg\n\ntype S interface {\n\tRun() int\n}\n",
+            "Run",
+            false,
+        ),
+        ("pkg/a.go", "package pkg\n\nfunc Run() {}\n", "Run", true),
+    ];
+
+    for (path, source, name, expected) in cases {
+        let parse = extract::extract(path, source).unwrap_or_else(|| panic!("{path} 沒有抽取器"));
+        let symbol = parse
+            .symbols
+            .iter()
+            .find(|s| s.name == *name)
+            .unwrap_or_else(|| panic!("{path} 找不到 {name}"));
+
+        assert_eq!(
+            symbol.has_body, *expected,
+            "{path} 的 {name}：has_body 應該是 {expected}"
+        );
+    }
+}

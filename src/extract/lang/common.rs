@@ -26,6 +26,9 @@ pub struct Declaration<'a> {
     pub container: &'a [String],
     pub signature: Option<String>,
     pub docstring: Option<String>,
+    /// 有沒有本體。只有宣告沒有本體的符號，與別處那個定義是同一件東西
+    /// 的兩面；不是函數的符號一律為真。
+    pub has_body: bool,
 }
 
 /// 收下一個符號，回傳它的 moniker。
@@ -42,6 +45,7 @@ pub fn push(node: Node<'_>, path: &str, decl: Declaration<'_>, out: &mut FilePar
         end_line: ts::end_line_of(node),
         signature: decl.signature,
         docstring: decl.docstring,
+        has_body: decl.has_body,
     });
 
     moniker
@@ -80,6 +84,16 @@ pub fn signature(
     let decl = full.get(..cut)?.trim_end().trim_end_matches(trim);
     let s = ts::collapse_whitespace(decl);
     if s.is_empty() { None } else { Some(s) }
+}
+
+/// 這個節點有沒有本體。
+///
+/// `body_fields` 與 [`signature`] 用同一份清單：切簽名的地方就是本體開始
+/// 的地方，兩者判斷的是同一件事。
+pub fn has_body(node: Node<'_>, body_fields: &[&str]) -> bool {
+    body_fields
+        .iter()
+        .any(|field| node.child_by_field_name(field).is_some())
 }
 
 pub fn field_text<'a>(node: Node<'_>, field: &str, source: &'a str) -> Option<&'a str> {

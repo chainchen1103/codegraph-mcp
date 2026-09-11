@@ -1,5 +1,6 @@
 //! 把抽取階段記下的引用解析成圖上的邊。
 
+pub mod definitions;
 pub mod imports;
 pub mod names;
 

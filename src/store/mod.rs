@@ -17,7 +17,7 @@ use crate::error::Result;
 pub const SCHEMA: &str = include_str!("schema.sql");
 
 /// 目前的 schema 版本。修改 `schema.sql` 時必須同步遞增並提供 migration。
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// 資料庫頁大小。必須在資料庫產生任何頁面之前設定，之後設定無效。
 const PAGE_SIZE: i64 = 4096;

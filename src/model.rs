@@ -80,6 +80,8 @@ pub enum Rel {
     Extends = 4,
     References = 5,
     Contains = 6,
+    /// 定義指向它的宣告。C/C++ 的 `.cpp` 指向 `.h`，trait 的實作指向簽名。
+    Defines = 7,
 }
 
 impl Rel {
@@ -93,6 +95,7 @@ impl Rel {
             4 => Extends,
             5 => References,
             6 => Contains,
+            7 => Defines,
             _ => return None,
         })
     }
@@ -107,6 +110,7 @@ impl Rel {
             Extends => "extends",
             References => "references",
             Contains => "contains",
+            Defines => "defines",
         }
     }
 }
@@ -155,6 +159,15 @@ pub struct RawSymbol {
     pub end_line: u32,
     pub signature: Option<String>,
     pub docstring: Option<String>,
+    /// 這個宣告有沒有本體。
+    ///
+    /// 只有宣告沒有本體的符號到處都是：C/C++ 的 header、Rust trait 的方法
+    /// 簽名、TypeScript interface 的方法、Java interface 的方法、Scala 的
+    /// 抽象 `def`。它們與別處那個有本體的定義是同一件東西的兩面，靠這一欄
+    /// 才分得出誰是誰。
+    ///
+    /// 不是函數的符號一律為真——結構與常數沒有「另一半」。
+    pub has_body: bool,
 }
 
 /// 抽取階段產生、尚未解析成邊的引用。
@@ -211,7 +224,7 @@ mod tests {
         assert_eq!(Kind::from_u8(0), None);
         assert_eq!(Kind::from_u8(99), None);
         assert_eq!(Rel::from_u8(0), None);
-        assert_eq!(Rel::from_u8(7), None);
+        assert_eq!(Rel::from_u8(8), None);
         assert_eq!(Provenance::from_u8(2), None);
     }
 
@@ -302,6 +315,7 @@ mod tests {
             end_line: 5,
             signature: Some("fn caller()".into()),
             docstring: None,
+            has_body: true,
         };
         assert_eq!(raw.from, raw_sym.moniker);
     }
