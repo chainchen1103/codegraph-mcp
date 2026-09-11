@@ -1,0 +1,198 @@
+name: Release
+
+# 推送 v* tag 時建置四個平台的執行檔並發布 GitHub Release。
+#
+# 修改這個檔案的 PR 也會跑一次完整建置（只建置、不發布），發布流程壞掉要在
+# merge 前就知道，而不是等到打 tag 那一刻。
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # 版本號只算一次，其他 job 都讀這裡的結果。
+  #
+  # tag 與 Cargo.toml 的版本不一致時直接失敗：發出去的執行檔 `--version` 印的
+  # 是 Cargo.toml 的值，對不上就是一個說謊的 Release。
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        shell: bash
+        run: |
+          crate=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [[ "$tag" != "$crate" ]]; then
+              echo "::error::tag v$tag 與 Cargo.toml 的版本 $crate 不一致"
+              exit 1
+            fi
+            echo "version=v$crate" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # musl 靜態連結：不依賴主機的 glibc 版本，任何 x86_64 Linux 都能跑。
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: ""
+            smoke: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            exe: ".exe"
+            smoke: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            exe: ""
+            smoke: true
+          # 在 arm64 runner 上交叉編譯。Rosetta 不保證存在，不跑冒煙測試。
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            exe: ""
+            smoke: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # tree-sitter 文法與 SQLite 都是 C，musl 目標要用 musl 的編譯器。
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # 真的跑一次：建索引、查詢、起 MCP。編得過不代表能用——靜態連結的
+      # 文法或 SQLite 出問題時，只會在執行期才看得到。
+      - name: Smoke test
+        if: matrix.smoke
+        shell: bash
+        run: |
+          bin="$PWD/target/${{ matrix.target }}/release/codegraph${{ matrix.exe }}"
+          "$bin" --version
+
+          # Windows 的 RUNNER_TEMP 是反斜線路徑，轉成正斜線兩邊都認得。
+          temp=$(cygpath -m "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")
+          project="$temp/smoke"
+          mkdir -p "$project/src" "$project/web" "$project/api"
+          printf 'pub fn target() {\n    helper();\n}\npub fn helper() {}\n' > "$project/src/lib.rs"
+          printf 'export function greet(): void {}\n' > "$project/web/app.ts"
+          printf 'def handler():\n    return 1\n' > "$project/api/views.py"
+
+          "$bin" init "$project"
+          "$bin" index "$project"
+          "$bin" status "$project" | tee status.txt
+          # 只比對 ASCII：Windows runner 上中文輸出的編碼不保證一致。
+          grep -q "schema v" status.txt
+
+          "$bin" explore target --path "$project" | tee explore.txt
+          grep -q "pub fn target" explore.txt
+
+          # stdin 關閉時 serve 會自己結束，不需要 timeout。
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' \
+            | "$bin" serve | head -n 1 | tee serve.txt
+          grep -q '"instructions"' serve.txt
+        timeout-minutes: 5
+
+      - name: Package
+        shell: bash
+        run: |
+          name="codegraph-${{ needs.version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/codegraph${{ matrix.exe }}" "dist/$name/"
+          cp README.md "dist/$name/"
+          cd dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a -tzip "$name.zip" "$name" > /dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codegraph-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/checkout 在 tag 事件上會把附註 tag 換成輕量 tag，附註內容就
+      # 不見了。重新抓一次原本的 tag 物件。
+      - name: Fetch annotated tag
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      # 發布說明寫在附註 tag 裡：誰打 tag 誰寫，不必另外維護一份檔案。
+      # GitHub 會在後面自動附上這一版合進來的 PR 清單。
+      - name: Release notes
+        run: |
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" \
+            | sed '/-----BEGIN PGP SIGNATURE-----/,$d' > notes.md
+          if [[ ! -s notes.md ]]; then
+            echo "codegraph $GITHUB_REF_NAME" > notes.md
+          fi
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: dist/*
+          generate_release_notes: true
+          # v0.2.0-rc.1 這種帶連字號的版本標成預覽版。
+          prerelease: ${{ contains(github.ref_name, '-') }}

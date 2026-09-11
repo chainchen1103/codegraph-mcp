@@ -2,6 +2,12 @@
 name = "code_graph"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "給 AI Agent 用的程式碼結構索引：tree-sitter 解析、SQLite 儲存、MCP 提供查詢"
+repository = "https://github.com/chainchen1103/codegraph-mcp"
+readme = "README.md"
+keywords = ["mcp", "tree-sitter", "code-intelligence", "sqlite"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "code_graph"
