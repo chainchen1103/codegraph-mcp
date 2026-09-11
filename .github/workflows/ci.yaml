@@ -39,3 +39,13 @@ jobs:
 
       - name: 3. Run Unit & Integration Tests
         run: cargo test --all-targets --all-features
+
+  # Cargo.toml 宣告的 rust-version 要真的編得過，否則那只是一句沒人驗證的話。
+  msrv:
+    name: Minimum supported Rust (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --locked
