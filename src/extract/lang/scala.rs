@@ -72,6 +72,11 @@ impl Extractor for ScalaExtractor {
     fn implicit_receiver(&self) -> bool {
         true
     }
+
+    /// Java、Kotlin、Scala 在同一個 JVM 上互相看得見對方的類別。
+    fn family(&self) -> &'static str {
+        "jvm"
+    }
 }
 
 /// `import a.b.C` 引入的名字是 `C`。

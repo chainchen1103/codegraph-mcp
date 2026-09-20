@@ -9,9 +9,15 @@
 //! 問題，兩個答案都要留著。方向朝宣告，是因為改宣告會波及定義：受影響
 //! 範圍看的是入邊。
 //!
-//! 這一層不認識任何語言，但**認得語言邊界**：判準是同一個語言裡限定名
-//! 相同，而且一邊有本體、另一邊沒有。少了語言這一維，八語言的專案裡
-//! 每個 `render` 都會跟其他七個連起來——限定名只在同一個語言裡才有意義。
+//! 這一層不認識任何語言，但**認得語言邊界**：判準是同一族之內限定名相同，
+//! 而且一邊有本體、另一邊沒有。少了語族這一維，八語言的專案裡每個
+//! `render` 都會跟其他七個連起來——限定名只在同一族之內才有意義。
+//!
+//! 界線畫在語族而不是單一語言：C 的 header 宣告與 `.c`／`.cpp`／`.cu` 裡的
+//! 定義屬於不同的抽取器，卻是同一件東西的兩面。哪些語言同族由抽取器自己
+//! 說（[`Extractor::family`]），這一層只拿來當分組的鍵。
+//!
+//! [`Extractor::family`]: crate::extract::Extractor::family
 
 use std::collections::HashMap;
 
@@ -79,10 +85,12 @@ pub fn link(conn: &Connection) -> Result<DefinitionReport> {
     Ok(report)
 }
 
-/// 依限定名分組的函數與方法。
+/// 依語族與限定名分組的函數與方法。
 ///
 /// 只看函數與方法：結構與常數沒有「宣告與定義分開」這回事，把它們算進來
 /// 只會讓同名的無關符號互相連邊。
+///
+/// 語言沒有註冊過時退回用語言名本身當鍵，那等於自成一族。
 fn candidates(conn: &Connection) -> Result<HashMap<(String, String), Vec<Symbol>>> {
     let mut stmt = conn.prepare(
         "SELECT f.language, s.qualified, s.id, s.file_id, s.has_body
@@ -92,8 +100,12 @@ fn candidates(conn: &Connection) -> Result<HashMap<(String, String), Vec<Symbol>
     )?;
 
     let rows = stmt.query_map([Kind::Function as u8, Kind::Method as u8], |r| {
+        let language: String = r.get(0)?;
+        let family = crate::extract::lang::family_of(&language)
+            .map(str::to_string)
+            .unwrap_or(language);
         Ok((
-            (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+            (family, r.get::<_, String>(1)?),
             Symbol {
                 id: r.get(2)?,
                 file_id: r.get(3)?,
@@ -219,6 +231,21 @@ mod tests {
         assert!(links(&store).is_empty());
     }
 
+    /// 同一族之內的不同語言是同一份程式碼的兩面。
+    ///
+    /// `.h` 由 C++ 的抽取器認領、`.c` 由 C 的，兩者的語言名不同，但 header
+    /// 裡那個宣告與 `.c` 裡那個定義就是同一個函數。
+    #[test]
+    fn a_declaration_links_across_languages_in_the_same_family() {
+        let store = indexed(&[
+            ("include/util.h", "int add(int a, int b);\n"),
+            ("src/util.c", "int add(int a, int b) { return a + b; }\n"),
+        ]);
+
+        let report = link(store.conn()).unwrap();
+        assert_eq!(report.linked, 1);
+        assert_eq!(links(&store), [("add".to_string(), "add".to_string())]);
+    }
     /// 重複執行不會累積重複的邊。
     #[test]
     fn linking_twice_changes_nothing() {

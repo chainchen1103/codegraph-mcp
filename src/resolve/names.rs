@@ -44,7 +44,11 @@ pub fn tail(name: &str) -> &str {
 /// 4. 全部落空表示那個容器不屬於這個專案，例如 `Vec::new`。判為外部，
 ///    不再退回去比對名字。
 pub fn resolve(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> Result<Match> {
-    let style = Style::of(ref_name, has_implicit_receiver(conn, from_file)?);
+    let caller = extractor_of(conn, from_file)?;
+    let ctx = Context {
+        style: Style::of(ref_name, caller.is_some_and(|e| e.implicit_receiver())),
+        family: caller.map(|e| e.family()),
+    };
 
     // import 排在最前面：作者明寫了這個名字來自哪個檔案，那是事實，
     // 其餘每一階都只是推測。
@@ -59,14 +63,14 @@ pub fn resolve(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> R
     // 就是有歧義，反而蓋掉「呼叫端自己的檔案裡就有一個」這個更強的
     // 訊號。
     if !ref_name.contains("::") {
-        return lookup(conn, Field::Name, tail(ref_name), from_file, rel, style);
+        return lookup(conn, Field::Name, tail(ref_name), from_file, rel, ctx);
     }
 
     let forms = suffixes(ref_name);
 
     // 原始碼裡怎麼寫的，先照著找。
     if let Some(written) = forms.first() {
-        match lookup(conn, Field::Qualified, written, from_file, rel, style)? {
+        match lookup(conn, Field::Qualified, written, from_file, rel, ctx)? {
             Match::None => {}
             found => return Ok(found),
         }
@@ -77,14 +81,14 @@ pub fn resolve(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> R
     // 這一步要排在縮短寫法之前：模組路徑用得到檔案的位置，比單純把
     // 前綴丟掉更具體。`query::parse` 縮成 `parse` 會撞上其他檔案裡的
     // 同名函數而變成有歧義，模組路徑卻能指出是哪一個。
-    match by_module(conn, ref_name, rel, style)? {
+    match by_module(conn, ref_name, rel, ctx)? {
         Match::None => {}
         found => return Ok(found),
     }
 
     // 再退到逐段縮短的寫法。
     for suffix in forms.iter().skip(1) {
-        match lookup(conn, Field::Qualified, suffix, from_file, rel, style)? {
+        match lookup(conn, Field::Qualified, suffix, from_file, rel, ctx)? {
             Match::None => continue,
             found => return Ok(found),
         }
@@ -131,27 +135,32 @@ fn by_import(conn: &Connection, ref_name: &str, from_file: i64, rel: Rel) -> Res
 /// 在指定的檔案裡找這個名字，限定名與裸名都比對。
 fn in_file(conn: &Connection, name: &str, file_id: i64, rel: Rel) -> Result<Match> {
     let sql = format!(
-        "SELECT id FROM symbols
-         WHERE file_id = ?2 AND (qualified = ?1 OR name = ?1 OR qualified LIKE '%::' || ?1){}
-         LIMIT 2",
+        "SELECT {COLUMNS} FROM symbols s
+         WHERE s.file_id = ?2 AND (s.qualified = ?1 OR s.name = ?1 OR s.qualified LIKE '%::' || ?1){}
+         LIMIT {LIMIT}",
         kind_filter(rel, Field::Qualified, Style::Direct)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     first_or_ambiguous(&mut stmt, rusqlite::params![name, file_id])
 }
 
-/// 這個檔案的語言在型別內部可不可以省略接收者。
+/// 認領這個檔案的抽取器。
 ///
-/// 屬於語言的性質，因此答案來自該語言的抽取器，不寫死在解析層。
-fn has_implicit_receiver(conn: &Connection, file_id: i64) -> Result<bool> {
+/// 解析階段要問語言的兩件事——裸名可不可以是方法、屬於哪一族——都是語言
+/// 的性質，答案來自該語言的抽取器，不寫死在這一層。索引裡沒有這個檔案、
+/// 或它的語言沒有註冊過時回 `None`，行為退化成不分語言。
+fn extractor_of(
+    conn: &Connection,
+    file_id: i64,
+) -> Result<Option<&'static dyn crate::extract::Extractor>> {
     let mut stmt = conn.prepare_cached("SELECT language FROM files WHERE id = ?1")?;
     let mut rows = stmt.query([file_id])?;
     let Some(row) = rows.next()? else {
-        return Ok(false);
+        return Ok(None);
     };
     let language: String = row.get(0)?;
 
-    Ok(crate::extract::lang::by_language(&language).is_some_and(|e| e.implicit_receiver()))
+    Ok(crate::extract::lang::by_language(&language))
 }
 
 /// 由長到短的後綴，只剝掉模組路徑。
@@ -193,7 +202,7 @@ fn is_module_like(segment: &str) -> bool {
 /// 檔案的位置，不是檔案裡的容器，逐段縮短永遠對不上。
 ///
 /// 只在容器全是模組名時嘗試。含大寫段的是型別，型別不對應到檔案。
-fn by_module(conn: &Connection, ref_name: &str, rel: Rel, style: Style) -> Result<Match> {
+fn by_module(conn: &Connection, ref_name: &str, rel: Rel, ctx: Context) -> Result<Match> {
     let Some((container, name)) = ref_name.rsplit_once("::") else {
         return Ok(Match::None);
     };
@@ -202,14 +211,59 @@ fn by_module(conn: &Connection, ref_name: &str, rel: Rel, style: Style) -> Resul
     }
 
     let sql = format!(
-        "SELECT s.id FROM symbols s JOIN files f ON f.id = s.file_id
+        "SELECT {COLUMNS} FROM symbols s JOIN files f ON f.id = s.file_id
          WHERE s.qualified = ?1
-           AND (f.module_path = ?2 OR f.module_path LIKE '%::' || ?2){}
-         LIMIT 2",
-        kind_filter(rel, Field::Qualified, style)
+           AND (f.module_path = ?2 OR f.module_path LIKE '%::' || ?2){}{}
+         LIMIT {LIMIT}",
+        kind_filter(rel, Field::Qualified, ctx.style),
+        family_clause(ctx.family)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     first_or_ambiguous(&mut stmt, rusqlite::params![name, container])
+}
+
+/// 每次查詢都取這三欄。
+///
+/// 限定名與有無本體是挑選候選時要看的——同一個限定名底下的宣告與定義
+/// 是同一件東西的兩面，不是兩個候選。
+const COLUMNS: &str = "s.id, s.qualified, s.has_body";
+
+/// 一次查詢最多取幾個候選。
+///
+/// 只要分得出「唯一」「宣告與定義的兩面」「其餘」三種情況就夠了，取滿
+/// 上限就表示候選多到一定有歧義。
+const CANDIDATE_LIMIT: usize = 8;
+
+/// SQL 的 `LIMIT`，多取一列才知道有沒有超過上限。
+const LIMIT: usize = CANDIDATE_LIMIT + 1;
+
+/// 一次比對的上下文。
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Context {
+    /// 呼叫在原始碼裡怎麼寫。
+    style: Style,
+    /// 呼叫端屬於哪一族。索引裡查不到語言時是 `None`，不加限制。
+    family: Option<&'static str>,
+}
+
+/// 把候選限制在同一族的語言裡。
+///
+/// 限定名只在同一族之內有意義：Python 的 `render` 與 Rust 的 `render` 撞名
+/// 而已，接起來就是一條錯的邊。同一族之內則要接得到——C 的 header 同時被
+/// C 與 C++ 引用，Kotlin 呼叫得到 Java 的類別。
+///
+/// 語言名來自註冊表，全部是原始碼裡的字面值，不含任何外部輸入。
+fn family_clause(family: Option<&'static str>) -> String {
+    let Some(family) = family else {
+        return String::new();
+    };
+    let languages = crate::extract::lang::languages_in_family(family);
+    if languages.is_empty() {
+        return String::new();
+    }
+
+    let quoted: Vec<String> = languages.iter().map(|l| format!("'{l}'")).collect();
+    format!(" AND f.language IN ({})", quoted.join(", "))
 }
 
 /// 呼叫的寫法。
@@ -309,9 +363,9 @@ fn lookup(
     value: &str,
     from_file: i64,
     rel: Rel,
-    style: Style,
+    ctx: Context,
 ) -> Result<Match> {
-    match unique_in_file(conn, field, value, from_file, rel, style)? {
+    match unique_in_file(conn, field, value, from_file, rel, ctx)? {
         Match::None => {}
         found => return Ok(found),
     }
@@ -319,7 +373,7 @@ fn lookup(
     // 只有帶容器的寫法才做結尾比對。單獨一個名字去比對任何容器的結尾，
     // 等於把 `new` 接到專案裡隨便一個建構函數上。
     if field == Field::Qualified && value.contains("::") {
-        match suffix_in_file(conn, value, from_file, rel, style)? {
+        match suffix_in_file(conn, value, from_file, rel, ctx)? {
             Match::None => {}
             found => return Ok(found),
         }
@@ -332,11 +386,11 @@ fn lookup(
     // `r.get(0)` 的 `r` 是外部函式庫的型別，專案裡碰巧也有 `get`，
     // 接上去就是一條錯的邊。同檔案裡有同名方法仍然算數，那是弱但
     // 真實的上下文。
-    if field == Field::Name && style == Style::Receiver {
+    if field == Field::Name && ctx.style == Style::Receiver {
         return Ok(Match::None);
     }
 
-    unique_anywhere(conn, field, value, rel, style)
+    unique_anywhere(conn, field, value, rel, ctx)
 }
 
 /// 同一個檔案裡，限定名以 `value` 結尾的符號。
@@ -345,11 +399,12 @@ fn suffix_in_file(
     value: &str,
     file_id: i64,
     rel: Rel,
-    style: Style,
+    ctx: Context,
 ) -> Result<Match> {
     let sql = format!(
-        "SELECT id FROM symbols WHERE qualified LIKE '%::' || ?1 AND file_id = ?2{} LIMIT 2",
-        kind_filter(rel, Field::Qualified, style)
+        "SELECT {COLUMNS} FROM symbols s
+         WHERE s.qualified LIKE '%::' || ?1 AND s.file_id = ?2{} LIMIT {LIMIT}",
+        kind_filter(rel, Field::Qualified, ctx.style)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     first_or_ambiguous(&mut stmt, rusqlite::params![value, file_id])
@@ -361,12 +416,12 @@ fn unique_in_file(
     value: &str,
     file_id: i64,
     rel: Rel,
-    style: Style,
+    ctx: Context,
 ) -> Result<Match> {
     let sql = format!(
-        "SELECT id FROM symbols WHERE {} = ?1 AND file_id = ?2{} LIMIT 2",
+        "SELECT {COLUMNS} FROM symbols s WHERE s.{} = ?1 AND s.file_id = ?2{} LIMIT {LIMIT}",
         field.column(),
-        kind_filter(rel, field, style)
+        kind_filter(rel, field, ctx.style)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     first_or_ambiguous(&mut stmt, rusqlite::params![value, file_id])
@@ -377,12 +432,14 @@ fn unique_anywhere(
     field: Field,
     value: &str,
     rel: Rel,
-    style: Style,
+    ctx: Context,
 ) -> Result<Match> {
     let sql = format!(
-        "SELECT id FROM symbols WHERE {} = ?1{} LIMIT 2",
+        "SELECT {COLUMNS} FROM symbols s JOIN files f ON f.id = s.file_id
+         WHERE s.{} = ?1{}{} LIMIT {LIMIT}",
         field.column(),
-        kind_filter(rel, field, style)
+        kind_filter(rel, field, ctx.style),
+        family_clause(ctx.family)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     first_or_ambiguous(&mut stmt, rusqlite::params![value])
@@ -449,22 +506,59 @@ fn trait_clause() -> &'static str {
 
 fn exclude_clause(kinds: &[Kind]) -> String {
     let ids: Vec<String> = kinds.iter().map(|k| (*k as u8).to_string()).collect();
-    format!(" AND kind NOT IN ({})", ids.join(", "))
+    format!(" AND s.kind NOT IN ({})", ids.join(", "))
 }
 
-/// 取最多兩列就夠了：有沒有第二列決定唯一或有歧義。
+/// 一個候選：識別碼、限定名，以及它有沒有本體。
+struct Candidate {
+    id: SymbolId,
+    qualified: String,
+    has_body: bool,
+}
+
+/// 查出候選，交給 [`pick`] 決定。
 fn first_or_ambiguous(
     stmt: &mut rusqlite::CachedStatement<'_>,
     params: &[&dyn rusqlite::ToSql],
 ) -> Result<Match> {
     let mut rows = stmt.query(params)?;
-    let first = match rows.next()? {
-        Some(row) => SymbolId(row.get(0)?),
-        None => return Ok(Match::None),
-    };
-    match rows.next()? {
-        Some(_) => Ok(Match::Ambiguous),
-        None => Ok(Match::One(first, Provenance::Static)),
+    let mut found = Vec::new();
+    while let Some(row) = rows.next()? {
+        found.push(Candidate {
+            id: SymbolId(row.get(0)?),
+            qualified: row.get(1)?,
+            has_body: row.get::<_, i64>(2)? != 0,
+        });
+    }
+    Ok(pick(&found))
+}
+
+/// 從候選裡挑出唯一的目標。
+///
+/// 同一個限定名底下同時有宣告與定義是常態：C/C++ 的 header 寫
+/// `void f(void);`、`.c` 寫本體，TypeScript 的多載簽名也是這樣。兩者是同
+/// 一件東西的兩面，不是兩個候選，呼叫要落在有本體的那一個——那裡才讀得
+/// 到程式碼，而宣告那一側另有一條 `Defines` 邊連過去。
+///
+/// 限定名不同就不是這回事，那是真的有歧義，不猜。
+fn pick(found: &[Candidate]) -> Match {
+    match found {
+        [] => Match::None,
+        [only] => Match::One(only.id, Provenance::Static),
+        // 取滿上限表示候選多到無從分辨。
+        many if many.len() > CANDIDATE_LIMIT => Match::Ambiguous,
+        many => {
+            if many.iter().any(|c| c.qualified != many[0].qualified) {
+                return Match::Ambiguous;
+            }
+            let mut bodies = many.iter().filter(|c| c.has_body);
+            match (bodies.next(), bodies.next()) {
+                (Some(only), None) => Match::One(only.id, Provenance::Static),
+                // 一個本體都沒有（全是宣告），或有好幾個本體（多載），
+                // 都分不出要接哪一個。
+                _ => Match::Ambiguous,
+            }
+        }
     }
 }
 
@@ -479,8 +573,10 @@ mod tests {
             .conn()
             .execute_batch(
                 "INSERT INTO units(id, name) VALUES (1, 'root');
-                 INSERT INTO files(id, path, unit_id, content_hash, indexed_at)
-                     VALUES (1, 'src/a.rs', 1, 'h', 0), (2, 'src/b.rs', 1, 'h', 0);",
+                 INSERT INTO files(id, path, unit_id, content_hash, indexed_at, language)
+                     VALUES (1, 'src/a.rs', 1, 'h', 0, 'rust'),
+                            (2, 'src/b.rs', 1, 'h', 0, 'rust'),
+                            (3, 'src/c.rs', 1, 'h', 0, 'rust');",
             )
             .unwrap();
 
@@ -503,6 +599,132 @@ mod tests {
 
     fn certain(id: u32) -> Match {
         Match::One(SymbolId(id), Provenance::Static)
+    }
+
+    /// 只有同一族的語言共用符號。
+    ///
+    /// 這是修過的 bug：少了語族這一維，Python 檔案裡的 `render()` 會接到
+    /// Rust 的 `render` 上——名字撞在一起而已，不是同一個東西。
+    #[test]
+    fn a_call_never_reaches_another_family() {
+        let s = store_with(&[("render", "render", Kind::Function, 1)]);
+        s.conn()
+            .execute_batch(
+                "UPDATE files SET language = 'rust' WHERE id = 1;
+                 UPDATE files SET path = 'api/views.py', language = 'python' WHERE id = 2;",
+            )
+            .unwrap();
+
+        assert_eq!(call(&s, "render", 2), Match::None);
+    }
+
+    /// 同一族之內要接得到：C 的 header 與 `.c` 是不同的抽取器，卻是同一
+    /// 份程式碼的兩面。
+    #[test]
+    fn a_call_reaches_the_rest_of_its_family() {
+        let s = store_with(&[("add", "add", Kind::Function, 1)]);
+        s.conn()
+            .execute_batch(
+                "UPDATE files SET path = 'include/util.h', language = 'cpp' WHERE id = 1;
+                 UPDATE files SET path = 'src/util.c', language = 'c' WHERE id = 2;",
+            )
+            .unwrap();
+
+        assert_eq!(call(&s, "add", 2), certain(1));
+    }
+
+    /// 語言沒有註冊過時不加限制，行為退回原本的樣子。
+    #[test]
+    fn an_unknown_language_does_not_restrict_anything() {
+        let s = store_with(&[("helper", "helper", Kind::Function, 1)]);
+        s.conn()
+            .execute("UPDATE files SET language = 'cobol' WHERE id = 2", [])
+            .unwrap();
+
+        assert_eq!(call(&s, "helper", 2), certain(1));
+    }
+
+    /// header 的宣告與 `.c` 的定義限定名相同，呼叫要落在有本體的那一個。
+    #[test]
+    fn a_declaration_and_its_definition_resolve_to_the_body() {
+        let s = store_with(&[
+            ("add", "add", Kind::Function, 1),
+            ("add", "add", Kind::Function, 2),
+        ]);
+        s.conn()
+            .execute("UPDATE symbols SET has_body = 0 WHERE id = 1", [])
+            .unwrap();
+
+        // 從第三個檔案呼叫，同檔優先才不會搶在合併之前命中。
+        assert_eq!(call(&s, "add", 3), certain(2));
+    }
+
+    /// 兩個都有本體就是多載，分不出要接哪一個。
+    #[test]
+    fn two_bodies_with_the_same_name_stay_ambiguous() {
+        let s = store_with(&[
+            ("add", "add", Kind::Function, 1),
+            ("add", "add", Kind::Function, 2),
+        ]);
+
+        assert_eq!(call(&s, "add", 3), Match::Ambiguous);
+    }
+
+    /// 全是宣告、沒有任何本體時也分不出來——那是被好幾份 header 重複宣告。
+    #[test]
+    fn declarations_without_any_body_stay_ambiguous() {
+        let s = store_with(&[
+            ("add", "add", Kind::Function, 1),
+            ("add", "add", Kind::Function, 2),
+        ]);
+        s.conn()
+            .execute("UPDATE symbols SET has_body = 0", [])
+            .unwrap();
+
+        assert_eq!(call(&s, "add", 3), Match::Ambiguous);
+    }
+
+    /// 限定名不同就是真的有歧義，不能因為只有一個有本體就挑它。
+    #[test]
+    fn different_qualified_names_are_not_two_faces_of_one_thing() {
+        let s = store_with(&[
+            ("area", "Shape::area", Kind::Function, 1),
+            ("area", "Square::area", Kind::Function, 2),
+        ]);
+        s.conn()
+            .execute("UPDATE symbols SET has_body = 0 WHERE id = 1", [])
+            .unwrap();
+
+        assert_eq!(call(&s, "area", 3), Match::Ambiguous);
+    }
+
+    #[test]
+    fn the_candidate_list_is_bounded() {
+        let mut found: Vec<Candidate> = (0..=CANDIDATE_LIMIT as u32)
+            .map(|i| Candidate {
+                id: SymbolId(i),
+                qualified: "add".to_string(),
+                has_body: i == 0,
+            })
+            .collect();
+        assert_eq!(pick(&found), Match::Ambiguous, "取滿上限就是有歧義");
+
+        found.truncate(2);
+        assert_eq!(pick(&found), Match::One(SymbolId(0), Provenance::Static));
+        assert_eq!(pick(&[]), Match::None);
+    }
+
+    /// 語族片段由註冊表產生，裡面只會有註冊過的語言名。
+    #[test]
+    fn the_family_clause_lists_the_whole_family() {
+        let clause = family_clause(Some("c"));
+        for language in ["'c'", "'cpp'", "'cuda'"] {
+            assert!(clause.contains(language), "{clause}");
+        }
+        assert!(!clause.contains("'rust'"), "{clause}");
+
+        assert_eq!(family_clause(None), "");
+        assert_eq!(family_clause(Some("cobol")), "");
     }
 
     #[test]

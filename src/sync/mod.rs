@@ -175,6 +175,10 @@ fn sync_one(
         let requeued = resolve::requeue_by_names(conn, &names)?;
         // 這條路徑只寫了一個檔案，索引裡查不到的名字可能只是還沒輪到。
         let resolved = resolve::resolve_pending(conn, resolve::Unknown::Keep)?.resolved;
+        // 宣告與定義幾乎不在同一個檔案裡：改了 `.c`，它與 header 的關係
+        // 也跟著變。整批重接一次是全表掃描，但只掃函數與方法，而且
+        // `INSERT OR IGNORE` 讓已經存在的邊不重複寫入。
+        resolve::definitions::link(conn)?;
 
         Ok((resolved, requeued))
     })?;

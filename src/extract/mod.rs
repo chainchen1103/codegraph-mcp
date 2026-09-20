@@ -95,6 +95,18 @@ pub trait Extractor: Send + Sync {
     fn implicit_receiver(&self) -> bool {
         false
     }
+
+    /// 這個語言屬於哪一族。
+    ///
+    /// 同一族的語言共用符號：C 的 header 同時被 C、C++、CUDA 引用，
+    /// TypeScript 與 JavaScript 互相 import，Kotlin 呼叫得到 Java 的類別。
+    /// 不同族之間則沒有關係——Python 的 `render` 與 Rust 的 `render` 只是
+    /// 撞名，解析階段靠這個界線避免把它們接起來。
+    ///
+    /// 預設自成一族。
+    fn family(&self) -> &'static str {
+        self.language()
+    }
 }
 
 /// 依副檔名取得抽取器，不支援的副檔名回 `None`。

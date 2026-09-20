@@ -84,6 +84,9 @@ fn resolve_one(files: &FileIndex, row: &Pending) -> Option<i64> {
     // 目錄模組的候選要試，`./components` 指的可能是 `components/index.ts`。
     let extractor = extract::extractor_for(std::path::Path::new(&row.from_path))?;
     let mut candidates: Vec<String> = Vec::new();
+    // import 的原文就寫了副檔名時（C 的 `#include "util.h"`），它自己就是
+    // 檔名。沒寫副檔名的語言只會多試一個對不到的候選。
+    candidates.push(base.clone());
     for ext in extractor.extensions() {
         candidates.push(format!("{base}.{ext}"));
     }
@@ -226,6 +229,18 @@ mod tests {
 
         let found = resolve_one(&files, &pending("web/app.ts", KIND_RELATIVE, "./utils"));
         assert_eq!(found, Some(2));
+    }
+
+    /// 寫了副檔名的 import 直接對到那個檔案。
+    #[test]
+    fn a_spec_that_names_the_file_resolves_as_written() {
+        let files = index(&[("include/util.h", 7)]);
+
+        let found = resolve_one(
+            &files,
+            &pending("src/util.c", KIND_RELATIVE, "../include/util.h"),
+        );
+        assert_eq!(found, Some(7));
     }
 
     /// 指向目錄時要試該語言的目錄模組檔名。
