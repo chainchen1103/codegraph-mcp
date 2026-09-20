@@ -35,6 +35,11 @@ impl Extractor for JavaScriptExtractor {
     fn module_path(&self, _rel_path: &str) -> String {
         String::new()
     }
+
+    /// TypeScript 與 JavaScript 是同一族：`.ts` 會 import `.js`，反過來也有。
+    fn family(&self) -> &'static str {
+        "ecmascript"
+    }
 }
 
 #[cfg(test)]

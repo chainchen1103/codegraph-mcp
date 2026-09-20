@@ -621,3 +621,201 @@ fn eight_languages_coexist_without_crossing() {
         .unwrap();
     assert_eq!(edges, 8, "每個語言各該有一條 handler → render");
 }
+
+/// 指定種類的邊，以限定名表示。
+fn edges_of(store: &Store, rel: code_graph::Rel) -> Vec<(String, String)> {
+    let mut stmt = store
+        .conn()
+        .prepare(
+            "SELECT a.qualified, b.qualified FROM relations r
+             JOIN symbols a ON a.id = r.src
+             JOIN symbols b ON b.id = r.dst
+             WHERE r.rel = ?1
+             ORDER BY a.qualified, b.qualified",
+        )
+        .unwrap();
+    stmt.query_map([rel as u8], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+/// 呼叫邊：呼叫者、被呼叫者，以及被呼叫者所在的檔案。
+fn calls_with_files(store: &Store) -> Vec<(String, String, String)> {
+    let mut stmt = store
+        .conn()
+        .prepare(
+            "SELECT a.qualified, b.qualified, f.path FROM relations r
+             JOIN symbols a ON a.id = r.src
+             JOIN symbols b ON b.id = r.dst
+             JOIN files f ON f.id = b.file_id
+             WHERE r.rel = ?1
+             ORDER BY a.qualified, b.qualified",
+        )
+        .unwrap();
+    stmt.query_map([code_graph::Rel::Calls as u8], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+}
+
+/// C 的宣告在 header、定義在 `.c`，兩邊是同一件東西的兩面。
+///
+/// 呼叫端要落在有本體的那一個——那裡才讀得到程式碼——而宣告那一側靠
+/// `Defines` 邊連過去。兩個檔案分屬 `cpp` 與 `c` 兩個抽取器，能接起來是
+/// 因為它們同族。
+#[test]
+fn a_c_header_declaration_links_to_its_definition() {
+    let f = Fixture::indexed(
+        "c-header",
+        &[
+            (
+                "include/util.h",
+                "#ifndef UTIL_H\n#define UTIL_H\nint add(int a, int b);\n#endif\n",
+            ),
+            (
+                "src/util.c",
+                "#include \"../include/util.h\"\nint add(int a, int b) { return a + b; }\n",
+            ),
+            (
+                "src/main.c",
+                "#include \"../include/util.h\"\nint main(void) { return add(1, 2); }\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    // 定義指向宣告。
+    let defines = edges_of(&store, code_graph::Rel::Defines);
+    assert_eq!(defines, [("add".to_string(), "add".to_string())]);
+
+    // 呼叫落在有本體的那一個，而不是被判成有歧義。
+    let calls: Vec<(String, String, String)> = calls_with_files(&store);
+    assert_eq!(
+        calls,
+        [(
+            "main".to_string(),
+            "add".to_string(),
+            "src/util.c".to_string()
+        )]
+    );
+
+    // `#include` 對得上那個 header。
+    let linked: i64 = query_one(
+        &store,
+        "SELECT count(*) FROM imports WHERE target_id IS NOT NULL",
+    );
+    assert_eq!(linked, 2, "兩個 .c 各有一條 include 要接上");
+}
+
+/// C++ 的方法宣告在類別裡、本體寫在 `.cpp`，限定名要一致才接得起來。
+#[test]
+fn a_cpp_method_defined_out_of_line_links_to_its_declaration() {
+    let f = Fixture::indexed(
+        "cpp-out-of-line",
+        &[
+            (
+                "include/widget.hpp",
+                "namespace app {\nclass Widget {\npublic:\n  void draw() const;\n  int area() const;\n};\n}\n",
+            ),
+            (
+                "src/widget.cpp",
+                "#include \"../include/widget.hpp\"\nnamespace app {\nvoid Widget::draw() const { this->area(); }\n}\nint app::Widget::area() const { return 1; }\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    let defines = edges_of(&store, code_graph::Rel::Defines);
+    assert_eq!(
+        defines,
+        [
+            (
+                "app::Widget::area".to_string(),
+                "app::Widget::area".to_string()
+            ),
+            (
+                "app::Widget::draw".to_string(),
+                "app::Widget::draw".to_string()
+            ),
+        ]
+    );
+
+    // `this->area()` 接到有本體的那一個。
+    let calls = calls_with_files(&store);
+    assert_eq!(
+        calls,
+        [(
+            "app::Widget::draw".to_string(),
+            "app::Widget::area".to_string(),
+            "src/widget.cpp".to_string()
+        )]
+    );
+}
+
+/// CUDA 的 kernel 啟動是呼叫，`.cuh` 的宣告與 `.cu` 的定義也是兩面。
+#[test]
+fn a_cuda_kernel_is_indexed_like_any_other_function() {
+    let f = Fixture::indexed(
+        "cuda-kernel",
+        &[
+            ("src/kernel.cuh", "__global__ void scale(float* y);\n"),
+            (
+                "src/kernel.cu",
+                "#include \"kernel.cuh\"\n__device__ float sq(float x) { return x * x; }\n__global__ void scale(float* y) { y[0] = sq(y[0]); }\n",
+            ),
+            (
+                "src/run.cu",
+                "#include \"kernel.cuh\"\nvoid launch(float* y) { scale<<<1, 32>>>(y); }\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    assert_eq!(
+        edges_of(&store, code_graph::Rel::Defines),
+        [("scale".to_string(), "scale".to_string())]
+    );
+
+    let calls = calls_with_files(&store);
+    assert_eq!(
+        calls,
+        [
+            (
+                "launch".to_string(),
+                "scale".to_string(),
+                "src/kernel.cu".to_string()
+            ),
+            (
+                "scale".to_string(),
+                "sq".to_string(),
+                "src/kernel.cu".to_string()
+            ),
+        ]
+    );
+}
+
+/// 不同族的語言只是名字撞在一起，不該連起來。
+///
+/// 這是修過的 bug：解析階段原本不看語言，專案裡只有 Rust 有 `render` 時，
+/// Python 的 `render()` 就會接到它身上。
+#[test]
+fn a_call_never_crosses_into_another_family() {
+    let f = Fixture::indexed(
+        "family-boundary",
+        &[
+            ("src/lib.rs", "pub fn render() {}\n"),
+            ("api/views.py", "def handler():\n    render()\n"),
+            ("src/util.c", "void draw(void) { render(); }\n"),
+        ],
+    );
+    let store = f.store();
+
+    assert!(
+        calls_with_files(&store).is_empty(),
+        "有邊跨過了語族：{:?}",
+        calls_with_files(&store)
+    );
+}

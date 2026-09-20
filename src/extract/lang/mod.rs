@@ -3,6 +3,7 @@
 //! 新增一個語言只需新增一個模組並在 [`all`] 加入一項。
 
 pub mod bindings;
+pub mod c_family;
 pub mod common;
 pub mod go;
 pub mod java;
@@ -25,6 +26,9 @@ fn all() -> &'static [&'static dyn super::Extractor] {
         &java::JavaExtractor,
         &scala::ScalaExtractor,
         &kotlin::KotlinExtractor,
+        &c_family::CExtractor,
+        &c_family::CppExtractor,
+        &c_family::CudaExtractor,
     ]
 }
 
@@ -44,6 +48,22 @@ pub fn by_language(name: &str) -> Option<&'static dyn super::Extractor> {
 /// 已支援的語言名稱。
 pub fn languages() -> Vec<&'static str> {
     all().iter().map(|e| e.language()).collect()
+}
+
+/// 這個語言屬於哪一族。沒註冊過的語言回 `None`。
+pub fn family_of(language: &str) -> Option<&'static str> {
+    by_language(language).map(|e| e.family())
+}
+
+/// 同一族裡的所有語言，包含自己。
+///
+/// 解析階段用它把候選限制在同一族之內。
+pub fn languages_in_family(family: &str) -> Vec<&'static str> {
+    all()
+        .iter()
+        .filter(|e| e.family() == family)
+        .map(|e| e.language())
+        .collect()
 }
 
 #[cfg(test)]
@@ -87,6 +107,13 @@ mod tests {
             ("scala", "scala"),
             ("kt", "kotlin"),
             ("kts", "kotlin"),
+            ("c", "c"),
+            ("h", "cpp"),
+            ("cpp", "cpp"),
+            ("hpp", "cpp"),
+            ("cc", "cpp"),
+            ("cu", "cuda"),
+            ("cuh", "cuda"),
         ] {
             let found = by_extension(ext).unwrap_or_else(|| panic!("{ext} 沒有抽取器"));
             assert_eq!(found.language(), language, "{ext}");
@@ -106,6 +133,9 @@ mod tests {
                 "java",
                 "scala",
                 "kotlin",
+                "c",
+                "cpp",
+                "cuda",
             ]
         );
     }

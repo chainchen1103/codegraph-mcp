@@ -336,6 +336,16 @@ fn declarations_without_bodies_are_marked_across_languages() {
             false,
         ),
         ("pkg/a.go", "package pkg\n\nfunc Run() {}\n", "Run", true),
+        ("include/a.h", "int run(void);\n", "run", false),
+        ("src/a.c", "int run(void) { return 0; }\n", "run", true),
+        (
+            "include/a.hpp",
+            "class C {\n  void run() const;\n};\n",
+            "run",
+            false,
+        ),
+        ("src/a.cpp", "void C::run() const {}\n", "run", true),
+        ("src/a.cu", "__global__ void run(void);\n", "run", false),
     ];
 
     for (path, source, name, expected) in cases {
