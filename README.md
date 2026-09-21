@@ -89,6 +89,7 @@ monorepo 只有部分子專案建了索引是常見情況，可以用 `projectPa
 | C | `.c` |
 | C++ | `.cpp` `.cc` `.cxx` `.hpp` `.hh` `.h` 等 |
 | CUDA | `.cu` `.cuh` |
+| PHP | `.php` `.phtml` |
 
 同一個 repo 裡混用多個語言沒有問題，各語言的符號與關係不會互相串接——除了
 本來就共用程式碼的那幾組：C / C++ / CUDA 共用 header，TypeScript 與
@@ -119,5 +120,5 @@ JavaScript 互相 import，Java / Kotlin / Scala 在同一個 JVM 上。
 早期版本。索引格式還在演進，升級後若 `status` 或查詢回報 schema 版本不相容，
 刪掉 `.codegraph/` 重新 `codegraph index` 即可——索引隨時可以從原始碼重建。
 
-規劃中但尚未提供的：PHP / Swift / Dart / Vue 等更多語言、CI 上預先建好索引供
+規劃中但尚未提供的：Swift / Dart / Vue 等更多語言、CI 上預先建好索引供
 開發端下載、PR 審查時列出 `git diff` 看不見的受影響呼叫端。

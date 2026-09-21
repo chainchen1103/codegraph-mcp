@@ -346,6 +346,13 @@ fn declarations_without_bodies_are_marked_across_languages() {
         ),
         ("src/a.cpp", "void C::run() const {}\n", "run", true),
         ("src/a.cu", "__global__ void run(void);\n", "run", false),
+        (
+            "src/A.php",
+            "<?php\ninterface S {\n  public function run(): void;\n}\n",
+            "run",
+            false,
+        ),
+        ("src/A.php", "<?php\nfunction run(): void {}\n", "run", true),
     ];
 
     for (path, source, name, expected) in cases {

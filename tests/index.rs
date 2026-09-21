@@ -819,3 +819,73 @@ fn a_call_never_crosses_into_another_family() {
         calls_with_files(&store)
     );
 }
+
+/// PHP 的 `use` 指名了那個類別在哪，但 PSR-4 把命名空間的前綴對到目錄，
+/// `App\Support\Helper` 住在 `src/Support/Helper.php`。
+#[test]
+fn a_php_call_resolves_through_a_psr4_import() {
+    let f = Fixture::indexed(
+        "php-psr4",
+        &[
+            (
+                "src/Support/Helper.php",
+                "<?php\nnamespace App\\Support;\nclass Helper {\n  public static function slug(string $s): string { return $s; }\n}\n",
+            ),
+            (
+                "src/Models/User.php",
+                "<?php\nnamespace App\\Models;\nuse App\\Support\\Helper;\nclass User {\n  public function name(): string { return Helper::slug('x'); }\n}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    let linked: i64 = query_one(
+        &store,
+        "SELECT count(*) FROM imports WHERE target_id IS NOT NULL",
+    );
+    assert_eq!(linked, 1, "use 沒有接上那個檔案");
+
+    assert_eq!(
+        calls_with_files(&store),
+        [(
+            "App::Models::User::name".to_string(),
+            "App::Support::Helper::slug".to_string(),
+            "src/Support/Helper.php".to_string()
+        )]
+    );
+}
+
+/// `$this->` 與 `parent::` 在抽取階段就改寫成限定名，跨檔也接得上。
+#[test]
+fn a_php_inherited_call_resolves_to_the_base_class() {
+    let f = Fixture::indexed(
+        "php-parent",
+        &[
+            (
+                "src/Model.php",
+                "<?php\nnamespace App;\nclass Model {\n  public function boot(): void {}\n}\n",
+            ),
+            (
+                "src/User.php",
+                "<?php\nnamespace App;\nclass User extends Model {\n  public function boot(): void { parent::boot(); $this->name(); }\n  public function name(): string { return 'a'; }\n}\n",
+            ),
+        ],
+    );
+    let store = f.store();
+
+    assert_eq!(
+        calls_with_files(&store),
+        [
+            (
+                "App::User::boot".to_string(),
+                "App::Model::boot".to_string(),
+                "src/Model.php".to_string()
+            ),
+            (
+                "App::User::boot".to_string(),
+                "App::User::name".to_string(),
+                "src/User.php".to_string()
+            ),
+        ]
+    );
+}
