@@ -112,6 +112,23 @@ fn resolve_one(files: &FileIndex, row: &Pending) -> Option<i64> {
                 return Some(matches[0]);
             }
         }
+        // 少掉的有時不只一層：PHP 的 PSR-4 把命名空間的**前綴**對到一個
+        // 目錄（`App\` 對到 `src/`），所以 `App/Support/Helper` 要剝掉第一
+        // 段才對得上 `src/Support/Helper.php`。逐段剝掉前綴再試，同樣只
+        // 接受唯一命中。
+        //
+        // 剝到只剩檔名就停：`Helper.php` 在專案裡剛好只有一個，不代表
+        // `use Vendor\Lib\Helper;` 指的是它。
+        for candidate in &candidates {
+            let mut segments: Vec<&str> = candidate.split('/').collect();
+            while segments.len() > 2 {
+                segments.remove(0);
+                let matches = files.suffix_matches(&segments.join("/"));
+                if matches.len() == 1 {
+                    return Some(matches[0]);
+                }
+            }
+        }
     }
     None
 }
@@ -262,6 +279,30 @@ mod tests {
 
         let found = resolve_one(&files, &pending("api/app.py", KIND_ROOTED, "pkg/mod"));
         assert_eq!(found, Some(4));
+    }
+
+    /// PSR-4 只把命名空間的前綴對到目錄，剝掉前綴才對得上。
+    #[test]
+    fn a_rooted_target_may_drop_its_leading_segments() {
+        let files = index(&[("src/Support/Helper.php", 8)]);
+
+        let found = resolve_one(
+            &files,
+            &pending("src/Models/User.php", KIND_ROOTED, "App/Support/Helper"),
+        );
+        assert_eq!(found, Some(8));
+    }
+
+    /// 剝到只剩檔名就停：同名的檔案到處都是，唯一不代表就是它。
+    #[test]
+    fn stripping_never_goes_down_to_the_bare_file_name() {
+        let files = index(&[("src/Support/Helper.php", 9)]);
+
+        let found = resolve_one(
+            &files,
+            &pending("src/Models/User.php", KIND_ROOTED, "Vendor/Lib/Helper"),
+        );
+        assert_eq!(found, None);
     }
 
     /// 結尾比對有兩個候選時不猜——接錯比接不上貴。

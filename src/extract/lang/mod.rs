@@ -10,6 +10,7 @@ pub mod java;
 pub mod javascript;
 pub mod jvm;
 pub mod kotlin;
+pub mod php;
 pub mod python;
 pub mod rust;
 pub mod scala;
@@ -29,6 +30,7 @@ fn all() -> &'static [&'static dyn super::Extractor] {
         &c_family::CExtractor,
         &c_family::CppExtractor,
         &c_family::CudaExtractor,
+        &php::PhpExtractor,
     ]
 }
 
@@ -87,7 +89,7 @@ mod tests {
     fn lookup_is_by_bare_extension() {
         assert!(by_extension("rs").is_some());
         assert!(by_extension(".rs").is_none(), "副檔名不應該帶點");
-        assert!(by_extension("php").is_none(), "還沒註冊的語言不該有抽取器");
+        assert!(by_extension("rb").is_none(), "還沒註冊的語言不該有抽取器");
     }
 
     /// 每個語言各認自己的副檔名，查得到對的那一個。
@@ -114,6 +116,7 @@ mod tests {
             ("cc", "cpp"),
             ("cu", "cuda"),
             ("cuh", "cuda"),
+            ("php", "php"),
         ] {
             let found = by_extension(ext).unwrap_or_else(|| panic!("{ext} 沒有抽取器"));
             assert_eq!(found.language(), language, "{ext}");
@@ -136,6 +139,7 @@ mod tests {
                 "c",
                 "cpp",
                 "cuda",
+                "php",
             ]
         );
     }
